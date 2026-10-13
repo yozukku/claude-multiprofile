@@ -78,7 +78,7 @@ export function findProfile(name) {
 
 // ---- Write -------------------------------------------------------------
 
-function saveRegistry(reg) {
+export function assertRegistryWritable() {
   const { state } = readRegistryRaw();
 
   // Never write over a file we couldn't parse: it may still hold the user's
@@ -92,6 +92,11 @@ function saveRegistry(reg) {
         `${REGISTRY_PATH}.bak if present), then re-run this command.`
     );
   }
+  return state;
+}
+
+function saveRegistry(reg) {
+  const state = assertRegistryWritable();
 
   // Keep one backup generation of the last known-good file so a bad write
   // or bad hand-edit is a copy away from recovery.

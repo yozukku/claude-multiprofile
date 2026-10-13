@@ -53,6 +53,7 @@ import {
   step,
   tildify,
   fileExists,
+  fileStaysWithinDir,
   titleCase,
 } from "./util.js";
 
@@ -165,6 +166,9 @@ export function seedDesktopMcpServers(
   if (Object.keys(servers).length === 0) return nothing;
 
   const file = desktopConfigFile(dataDir);
+  if (!fileStaysWithinDir(file, dataDir)) {
+    return { status: "foreign", reason: "unsafe-path", added: [], total: 0 };
+  }
   let config = {};
   if (fileExists(file)) {
     try {
@@ -400,6 +404,22 @@ export function uniqueBundleId(name) {
 // are exposed to the LaunchServices collision bug. `doctor` looks for it.
 export const DEFAULT_APPLET_BUNDLE_ID = "com.apple.ScriptEditor.id.applet";
 
+export function isOwnLauncher(appPath) {
+  const id = getBundleId(appPath);
+  if (typeof id === "string" && id.startsWith("com.claude-multiprofile.")) return true;
+  if (id !== null && id !== DEFAULT_APPLET_BUNDLE_ID) return false;
+  const plist = path.join(appPath, "Contents", "Info.plist");
+  if (!fileExists(plist)) return false;
+  try {
+    return execFileSync(PLIST_BUDDY, ["-c", "Print :CFBundleExecutable", plist], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim() === "applet";
+  } catch {
+    return false;
+  }
+}
+
 export function getBundleId(appPath) {
   const plist = path.join(appPath, "Contents", "Info.plist");
   if (!fileExists(plist)) return null;
@@ -512,6 +532,19 @@ export function setBundleId(appPath, bundleId) {
   return true;
 }
 
+export function setBundleName(appPath, bundleName) {
+  const plist = path.join(appPath, "Contents", "Info.plist");
+  if (!fileExists(plist)) return false;
+  try {
+    execFileSync("/usr/bin/plutil", ["-replace", "CFBundleName", "-string", bundleName, plist], {
+      stdio: "pipe",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function stripQuarantine(appPath) {
   // Removes any com.apple.quarantine attribute applied by Gatekeeper. On a
   // freshly osacompile'd bundle there usually isn't one, but if the user
@@ -583,8 +616,15 @@ export function compileApp({
   // is not on disk yet.
   // A launcher written over the app it opens would delete that app and then
   // open itself. macOS disks ignore case, so compare that way.
-  if (path.resolve(appPath).toLowerCase() === path.resolve(claudeAppPath).toLowerCase()) {
+  const samePath = (a, b) => path.resolve(a).normalize("NFC").toLowerCase() === path.resolve(b).normalize("NFC").toLowerCase();
+  if (samePath(appPath, claudeAppPath)) {
     throw new Error(`the launcher path ${appPath} is the same as the app it opens`);
+  }
+  if (sourceAppPath && samePath(appPath, sourceAppPath)) {
+    throw new Error(`the launcher path ${appPath} is the same as the Claude.app this profile's copy is built from`);
+  }
+  if (fileExists(appPath) && !isOwnLauncher(appPath)) {
+    throw new Error(`${appPath} already exists and is not a claude-multiprofile launcher (bundle ${getBundleId(appPath) || "unknown"}); left it alone`);
   }
 
   let helper = null;
@@ -602,7 +642,9 @@ export function compileApp({
   fs.mkdirSync(path.dirname(appPath), { recursive: true });
 
   // Compile into the temp directory first, never straight over the target.
-  const staged = path.join(tmpDir, "staged.app");
+  // Use the launcher's own filename: osacompile names the bundle after it,
+  // and that CFBundleName is what Raycast, Alfred and the app switcher show.
+  const staged = path.join(tmpDir, path.basename(appPath));
   execFileSync("/usr/bin/osacompile", ["-o", staged, scriptPath], {
     stdio: "pipe",
   });
@@ -629,6 +671,7 @@ export function compileApp({
   // Stamp a unique CFBundleIdentifier so multiple profiles don't collide
   // in LaunchServices (see notes on uniqueBundleId).
   setBundleId(appPath, uniqueBundleId(name));
+  setBundleName(appPath, path.basename(appPath, ".app"));
 
   // Make applet.icns the ONLY icon source.
   //
@@ -730,7 +773,9 @@ export function setupDesktop({
     } else if (mcp.status === "current") {
       ok(`MCP connectors already in place (${mcp.total}).`);
     } else if (mcp.status === "foreign") {
-      warn("This data folder's claude_desktop_config.json could not be parsed; left it alone.");
+      warn(mcp.reason === "unsafe-path"
+        ? "This data folder's claude_desktop_config.json resolves outside the profile or has a broken link; left it alone."
+        : "This data folder's claude_desktop_config.json could not be parsed; left it alone.");
       info(`  Its connectors stay as they are. ${command("claude-multiprofile doctor")} re-checks this.`);
     }
   }

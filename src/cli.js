@@ -153,6 +153,11 @@ export async function run(argv) {
     rest = [];
   }
 
+  if (rest.includes("--help") || rest.includes("-h")) {
+    console.log(HELP);
+    return;
+  }
+
   if (argv[0]) remindIfFixesPending(cmd);
 
   const handlers = { add, list, status, doctor, extensions, rename, repair, remove, upgrade, "self-update": selfUpdate };

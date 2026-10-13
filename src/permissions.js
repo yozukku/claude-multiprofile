@@ -91,6 +91,9 @@ function denyRuleForPath(absPath) {
 // the user's default ~/.claude, which is their primary and denying it would be
 // surprising; issue #4 is about profiles discovering *each other*.
 function managedRulesForProfile(profile, allProfiles) {
+  const own = [profile.code && profile.code.configDir, profile.desktop && profile.desktop.dataDir]
+    .map((d) => denyRuleForPath(d))
+    .filter(Boolean);
   const rules = [];
   for (const other of allProfiles) {
     if (other.name === profile.name) continue;
@@ -99,7 +102,7 @@ function managedRulesForProfile(profile, allProfiles) {
     if (other.desktop && other.desktop.dataDir) dirs.push(other.desktop.dataDir);
     for (const d of dirs) {
       const rule = denyRuleForPath(d);
-      if (rule && !rules.includes(rule)) rules.push(rule);
+      if (rule && !own.includes(rule) && !rules.includes(rule)) rules.push(rule);
     }
   }
   return rules.sort();

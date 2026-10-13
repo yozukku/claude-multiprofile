@@ -47,6 +47,7 @@ import {
   pathStr,
   tildify,
   fileExists,
+  fileStaysWithinDir,
   dim,
   command,
 } from "../util.js";
@@ -109,6 +110,12 @@ function copyExtension(ext, targetDataDir) {
   fs.mkdirSync(targetSettingsDir, { recursive: true });
 
   const targetFolder = path.join(targetExtDir, ext.id);
+  const targetSettings = path.join(targetSettingsDir, `${ext.id}.json`);
+  for (const p of [targetExtDir, targetSettingsDir, targetSettings]) {
+    if (!fileStaysWithinDir(p, targetDataDir)) {
+      throw new Error(`${tildify(p)} resolves outside the profile or is a broken link, so nothing was copied`);
+    }
+  }
 
   // Remove existing target first so cp -R doesn't merge into a stale copy.
   if (fileExists(targetFolder)) {
@@ -117,7 +124,6 @@ function copyExtension(ext, targetDataDir) {
   execFileSync("/bin/cp", ["-R", ext.folderPath, targetFolder]);
 
   if (ext.hasSettings) {
-    const targetSettings = path.join(targetSettingsDir, `${ext.id}.json`);
     fs.copyFileSync(ext.settingsPath, targetSettings);
   }
 }
@@ -324,6 +330,8 @@ async function copyConnectorsStep(names, source, target) {
   const r = seedDesktopMcpServers(target.dataDir, { sourceFile: desktopConfigFile(source.dataDir), only: selected });
   if (r.status === "seeded") ok(`Connectors: copied ${r.added.join(", ")}.`);
   else if (r.status === "foreign") {
-    warn(`${target.label}'s claude_desktop_config.json is not valid JSON, so it was left alone.`);
+    warn(r.reason === "unsafe-path"
+      ? `${target.label}'s claude_desktop_config.json resolves outside the profile or has a broken link, so it was left alone.`
+      : `${target.label}'s claude_desktop_config.json is not valid JSON, so it was left alone.`);
   } else info("Nothing new to copy.");
 }

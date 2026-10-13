@@ -63,6 +63,10 @@ function applyFixes(binary, version) {
 }
 
 export async function upgrade(args = []) {
+  const unknown = args.filter((a) => a !== "--no-fix");
+  if (unknown.length > 0) {
+    throw new Error(`Unknown option for upgrade: ${unknown.join(" ")}. Expected --no-fix.`);
+  }
   header("Upgrade claude-multiprofile");
 
   const skipFixes = args.includes("--no-fix");

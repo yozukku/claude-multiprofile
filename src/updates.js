@@ -31,7 +31,8 @@ const MARKER = ".claude-multiprofile";
 
 // Mirrors Claude's own rule: a data dir already ending in -3p is used as is.
 export function localConfigRootFor(dataDir) {
-  return dataDir.endsWith("-3p") ? dataDir : `${dataDir}-3p`;
+  const dir = path.resolve(dataDir);
+  return dir.endsWith("-3p") ? dir : `${dir}-3p`;
 }
 
 function libraryDir(dataDir) {
@@ -46,6 +47,93 @@ function readJson(file) {
   }
 }
 
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function markerEntryId(root) {
+  const marker = readJson(path.join(root, MARKER));
+  const id = isPlainObject(marker) ? marker.entryId : null;
+  return typeof id === "string" && /^[A-Za-z0-9-]+$/.test(id) ? id : null;
+}
+
+function isOwnEntry(entry) {
+  return isPlainObject(entry) && Object.keys(entry).every((k) => k === "disableAutoUpdates");
+}
+
+function isOwnMeta(meta, id) {
+  return (
+    isPlainObject(meta) &&
+    meta.appliedId === id &&
+    Object.keys(meta).every((k) => k === "appliedId" || k === "entries") &&
+    Array.isArray(meta.entries) &&
+    meta.entries.every((e) => isPlainObject(e) && e.id === id)
+  );
+}
+
+function stateAt(root) {
+  const lib = path.join(root, "configLibrary");
+  const meta = readJson(path.join(lib, "_meta.json"));
+  if (!meta) return { state: "absent", blocked: false };
+
+  const entryFile = meta.appliedId ? path.join(lib, `${meta.appliedId}.json`) : null;
+  const entry = entryFile ? readJson(entryFile) : null;
+  const blocked = Boolean(entry && entry.disableAutoUpdates === true);
+
+  const id = markerEntryId(root);
+  let names = [];
+  try {
+    names = fs.readdirSync(lib);
+  } catch {
+    names = [];
+  }
+  const ours =
+    Boolean(id) &&
+    isOwnMeta(meta, id) &&
+    names.every((n) => n === "_meta.json" || n === `${id}.json`) &&
+    (!fileExists(entryFile) || isOwnEntry(entry));
+  if (ours) return { state: blocked ? "blocked" : "absent", blocked };
+  return { state: "foreign", blocked };
+}
+
+function removeIfEmpty(dir) {
+  try {
+    if (fs.readdirSync(dir).length === 0) {
+      fs.rmdirSync(dir);
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function removeOwnFiles(root) {
+  const lib = path.join(root, "configLibrary");
+  const removed = [];
+  const id = markerEntryId(root);
+  if (id) {
+    const entryFile = path.join(lib, `${id}.json`);
+    if (fileExists(entryFile) && isOwnEntry(readJson(entryFile))) {
+      fs.rmSync(entryFile, { force: true });
+      removed.push(entryFile);
+    }
+    const metaFile = path.join(lib, "_meta.json");
+    if (!fileExists(entryFile) && fileExists(metaFile) && isOwnMeta(readJson(metaFile), id)) {
+      fs.rmSync(metaFile, { force: true });
+      removed.push(metaFile);
+    }
+  }
+  const markerFile = path.join(root, MARKER);
+  if (fileExists(markerFile)) {
+    fs.rmSync(markerFile, { force: true });
+    removed.push(markerFile);
+  }
+  if (removeIfEmpty(lib)) removed.push(lib);
+  if (removeIfEmpty(root)) removed.push(root);
+  return removed;
+}
+
 // Where a profile stands:
 //   "blocked"  the tool's own block is in place
 //   "absent"   no local configuration at all; the copy updates itself
@@ -53,17 +141,7 @@ function readJson(file) {
 //              user's third-party inference setup. Never touched. `blocked`
 //              says whether it happens to block updates anyway.
 export function updateBlockState(dataDir) {
-  const lib = libraryDir(dataDir);
-  const meta = readJson(path.join(lib, "_meta.json"));
-  if (!meta) return { state: "absent", blocked: false };
-
-  const entry = meta.appliedId ? readJson(path.join(lib, `${meta.appliedId}.json`)) : null;
-  const blocked = Boolean(entry && entry.disableAutoUpdates === true);
-
-  const marker = readJson(path.join(localConfigRootFor(dataDir), MARKER));
-  const ours = Boolean(marker && marker.entryId && marker.entryId === meta.appliedId);
-  if (ours) return { state: blocked ? "blocked" : "absent", blocked };
-  return { state: "foreign", blocked };
+  return stateAt(localConfigRootFor(dataDir));
 }
 
 // Returns "created", "already", or "foreign" (left alone).
@@ -74,11 +152,8 @@ export function blockUpdates(dataDir) {
 
   const root = localConfigRootFor(dataDir);
   const lib = libraryDir(dataDir);
-  // "absent" can still mean our own marker with a damaged entry; start clean
-  // only inside a folder that is ours or empty.
-  const ours = fileExists(path.join(root, MARKER));
-  if (fileExists(lib) && !ours) return "foreign";
-  if (ours) fs.rmSync(lib, { recursive: true, force: true });
+  if (fileExists(path.join(root, MARKER))) removeOwnFiles(root);
+  if (fileExists(lib)) return "foreign";
 
   fs.mkdirSync(lib, { recursive: true });
   const id = crypto.randomUUID();
@@ -102,20 +177,15 @@ export function blockUpdates(dataDir) {
   return "created";
 }
 
+export function removeUpdateBlockAt(root) {
+  if (!fileExists(path.join(root, MARKER))) return null;
+  if (stateAt(root).state === "foreign") return null;
+  return removeOwnFiles(root);
+}
+
 // Removes only what the tool wrote. Returns true if anything was removed.
 export function unblockUpdates(dataDir) {
-  const root = localConfigRootFor(dataDir);
-  if (!fileExists(path.join(root, MARKER))) return false;
-  if (updateBlockState(dataDir).state === "foreign") return false;
-  fs.rmSync(libraryDir(dataDir), { recursive: true, force: true });
-  fs.rmSync(path.join(root, MARKER), { force: true });
-  // Leave the -3p folder if Claude has put anything else in it.
-  try {
-    if (fs.readdirSync(root).length === 0) fs.rmdirSync(root);
-  } catch {
-    // Already gone, or not empty; either is fine.
-  }
-  return true;
+  return removeUpdateBlockAt(localConfigRootFor(dataDir)) !== null;
 }
 
 // For rename: carry our block along when the data dir moves. Claude derives

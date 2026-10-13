@@ -104,7 +104,7 @@ export async function repair(args) {
 
   if (!fileExists(appPath)) {
     err(`Launcher .app not found on disk.`);
-    info(`Re-run ${command(`claude-multiprofile add`)} to recreate it (use the same profile name and paths to keep your data folder).`);
+    info(`Rebuild it with ${command("claude-multiprofile doctor --fix")}; the data folder is not touched.`);
     process.exit(1);
   }
 

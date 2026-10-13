@@ -102,6 +102,31 @@ export function expandHome(p) {
   return p;
 }
 
+export function resolveUserPath(p) {
+  const expanded = expandHome(String(p == null ? "" : p).trim());
+  if (!expanded || !path.isAbsolute(expanded)) return null;
+  return path.resolve(expanded);
+}
+
+function comparablePath(p) {
+  const resolved = path.resolve(String(p));
+  return process.platform === "darwin" ? resolved.toLowerCase() : resolved;
+}
+
+export function samePath(a, b) {
+  if (!a || !b) return false;
+  return comparablePath(a) === comparablePath(b);
+}
+
+export function pathsOverlap(a, b) {
+  if (!a || !b) return false;
+  const x = comparablePath(a);
+  const y = comparablePath(b);
+  if (x === y) return true;
+  const within = (inner, outer) => inner.startsWith(outer.endsWith(path.sep) ? outer : outer + path.sep);
+  return within(x, y) || within(y, x);
+}
+
 export function tildify(p) {
   // The reverse: shorten "/Users/x/foo" to "~/foo" for display.
   if (!p) return p;
@@ -130,6 +155,27 @@ export function fileExists(p) {
   try {
     fs.accessSync(p, fs.constants.F_OK);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+// Resolve both files and parent directories before writing inside a profile.
+// Broken links and links escaping the profile are never safe write targets.
+export function fileStaysWithinDir(file, dir) {
+  try {
+    const root = fs.realpathSync(dir);
+    let exists = true;
+    try {
+      fs.lstatSync(file);
+    } catch (e) {
+      if (e.code !== "ENOENT") return false;
+      exists = false;
+    }
+    const target = exists
+      ? fs.realpathSync(file)
+      : path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+    return target.startsWith(root + path.sep);
   } catch {
     return false;
   }

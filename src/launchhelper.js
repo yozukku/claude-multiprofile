@@ -29,7 +29,7 @@ import { HOME, fileExists } from "./util.js";
 import { COLORS } from "./appclone.js";
 
 // Bump when HELPER_JS changes, so doctor can tell a stale copy on disk.
-export const HELPER_VERSION = 1;
+export const HELPER_VERSION = 3;
 
 const TOOL_DIR = path.join(HOME, "Library", "Application Support", "claude-multiprofile");
 export const HELPER_PATH = path.join(TOOL_DIR, "bin", "launch.js");
@@ -215,22 +215,63 @@ function tint(appPath, hue) {
   if (!ok) throw new Error('could not set the icon');
 }
 
+var TINT_RUN = "ObjC.import('AppKit'); ObjC.import('CoreImage'); var fm = $.NSFileManager.defaultManager; " +
+  tint.toString() + " function run(argv) { tint(argv[0], argv[1]); return 'OK'; }";
+
+function tintApart(appPath, hue) {
+  var out = app.doShellScript('/usr/bin/osascript -l JavaScript -e ' + q(TINT_RUN) + ' ' + q(appPath) + ' ' + q(hue));
+  if (out !== 'OK') throw new Error('the icon step ended without setting the icon');
+}
+
+function helperBusy(clone) {
+  var me = $.NSProcessInfo.processInfo.processIdentifier;
+  var needle = 'launch.js ' + clone + ' ';
+  return app.doShellScript('/bin/ps -axww -o pid=,command=').split(/[\\r\\n]+/).some(function (line) {
+    var m = line.match(/^\\s*(\\d+)\\s+(.*)$/);
+    return m && parseInt(m[1], 10) !== me && m[2].indexOf(needle) >= 0;
+  });
+}
+
+function recover(clone, tmp, old) {
+  var restored = false;
+  try {
+    if (!exists(clone) && exists(old)) { app.doShellScript('/bin/mv ' + q(old) + ' ' + q(clone)); restored = true; }
+    if (exists(tmp)) app.doShellScript('/bin/rm -rf ' + q(tmp));
+    if (exists(old) && exists(clone)) app.doShellScript('/bin/rm -rf ' + q(old));
+  } catch (e) {
+    log('ERROR', 'an earlier update of the copy stopped partway, and cleaning up after it failed: ' + e.message +
+      '. Run claude-multiprofile doctor --fix');
+    return 'interrupted';
+  }
+  log('ERROR', 'an earlier update of the copy stopped partway' + (restored ? '; put the previous copy back' : '') +
+    '; opening ' + version(clone) + ' as is. The next launch tries the update again');
+  return 'interrupted';
+}
+
 // Rebuild the copy from its source when the source is newer. The new copy is
 // built beside the old one and swapped in only once it is complete, so a
 // failure at any step leaves the old copy exactly as it was.
 function refresh(clone, source, hue) {
+  var tmp = clone + '.refreshing', old = clone + '.previous';
+  if (exists(tmp) || exists(old)) {
+    if (helperBusy(clone)) return 'busy';
+    return env('CMP_LAUNCH_DRY_RUN') === '1' ? 'interrupted' : recover(clone, tmp, old);
+  }
   var have = version(clone), want = version(source);
   if (!have || !want) { log('WARN', 'could not read versions (copy ' + have + ', source ' + want + '); opening as is'); return 'unknown'; }
   if (compare(have, want) >= 0) return 'current';
   if (env('CMP_LAUNCH_DRY_RUN') === '1') return 'would-refresh ' + have + ' -> ' + want;
 
-  var tmp = clone + '.refreshing', old = clone + '.previous';
+  log('INFO', 'updating the copy from ' + have + ' to ' + want);
   try {
     if (exists(tmp)) app.doShellScript('/bin/rm -rf ' + q(tmp));
     try { app.doShellScript('/bin/cp -Rc ' + q(source) + ' ' + q(tmp)); }
-    catch (e) { app.doShellScript('/bin/cp -R ' + q(source) + ' ' + q(tmp)); }
+    catch (e) {
+      if (exists(tmp)) app.doShellScript('/bin/rm -rf ' + q(tmp));
+      app.doShellScript('/bin/cp -R ' + q(source) + ' ' + q(tmp));
+    }
     if (version(tmp) !== want) throw new Error('the copy came out as ' + version(tmp) + ', not ' + want);
-    if (hue) tint(tmp, hue);
+    if (hue) tintApart(tmp, hue);
     if (exists(old)) app.doShellScript('/bin/rm -rf ' + q(old));
     app.doShellScript('/bin/mv ' + q(clone) + ' ' + q(old));
     try { app.doShellScript('/bin/mv ' + q(tmp) + ' ' + q(clone)); }
@@ -325,6 +366,7 @@ function run(argv) {
     }
     var r = refresh(clone, source, hue);
     if (dry) return 'not running: ' + r;
+    if (r === 'busy') return 'busy';
   } catch (e) {
     log('ERROR', 'unexpected: ' + e.message + '; opening as is');
     if (dry) return 'error: ' + e.message;

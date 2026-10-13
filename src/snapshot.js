@@ -7,7 +7,7 @@
 //
 // What a snapshot covers: the small files --fix edits. Each Code profile's
 // settings.json and plugin manifests; each launcher's script, Info.plist and
-// icon; the launch helper; the update-block folders it creates; state.json.
+// icon; the launch helper; the update-block folders it creates.
 //
 // What it does not: rebuilt copies of Claude.app, a re-applied colour, and a
 // launcher's removed asset catalog. Those are rebuilt from the installed
@@ -21,12 +21,13 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { configDir } from "./registry.js";
-import { localConfigRootFor } from "./updates.js";
+import { localConfigRootFor, removeUpdateBlockAt } from "./updates.js";
 import { HELPER_PATH } from "./launchhelper.js";
 
 const SNAP_ROOT = path.join(configDir(), "snapshots");
 const KEEP = 10;
 const MARKER = ".claude-multiprofile";
+const STATE_FILE = path.join(configDir(), "state.json");
 
 function sha(file) {
   try {
@@ -38,7 +39,7 @@ function sha(file) {
 
 // Every path a fix run may edit, for this registry.
 export function fixTargets(reg) {
-  const files = [HELPER_PATH, path.join(configDir(), "state.json")];
+  const files = [HELPER_PATH];
   const dirs = [];
   for (const p of (reg && reg.profiles) || []) {
     if (p.code && p.code.configDir) {
@@ -155,10 +156,15 @@ export function undoLatest({ force = false } = {}) {
         result.skipped.push({ path: e.path, why: "no longer the tool's own folder" });
         continue;
       }
-      fs.rmSync(e.path, { recursive: true, force: true });
-      result.removed.push(e.path);
+      const removed = removeUpdateBlockAt(e.path);
+      if (removed === null) {
+        result.skipped.push({ path: e.path, why: "it now holds a configuration the tool did not write" });
+        continue;
+      }
+      result.removed.push(...removed.filter((p) => p === e.path || !removed.includes(path.dirname(p))));
       continue;
     }
+    if (e.path === STATE_FILE) continue;
     const now = sha(e.path);
     if (!force && now !== e.after) {
       result.skipped.push({ path: e.path, why: "changed since that run" });

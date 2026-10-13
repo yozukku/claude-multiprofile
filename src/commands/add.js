@@ -27,13 +27,15 @@ import {
   command,
   pathStr,
   tildify,
-  expandHome,
   fileExists,
   isMac,
   sanitizeName,
   titleCase,
+  resolveUserPath,
+  samePath,
+  pathsOverlap,
 } from "../util.js";
-import { findProfile, addToRegistry, getRegistry, replaceProfile } from "../registry.js";
+import { findProfile, addToRegistry, getRegistry, replaceProfile, assertRegistryWritable } from "../registry.js";
 import { readState, recordFixPass, toolVersion } from "../state.js";
 import { resyncDenyRules } from "../permissions.js";
 import {
@@ -44,6 +46,7 @@ import {
   compileApp,
   launchTargetFor,
   copyClaudeIcon,
+  isOwnLauncher,
   DEFAULT_DESKTOP_CONFIG_FILE,
 } from "../desktop.js";
 
@@ -56,8 +59,9 @@ import {
   ghTokenOverride,
   defaultGhConfigDirFor,
   addAlias,
+  managedAliasConflict,
 } from "../code.js";
-import { detectShell, rcPathForShell } from "../shell.js";
+import { detectShell, rcPathForShell, aliasTargetFor } from "../shell.js";
 import { COLORS } from "../appclone.js";
 
 const LSREGISTER =
@@ -105,14 +109,58 @@ function isUnmanagedExistingDir(dirPath) {
   if (!fileExists(dirPath)) return false;
   const reg = getRegistry();
   for (const p of reg.profiles) {
-    if (p.code && p.code.configDir === dirPath) return false;
-    if (p.desktop && p.desktop.dataDir === dirPath) return false;
+    if (p.code && samePath(p.code.configDir, dirPath)) return false;
+    if (p.desktop && samePath(p.desktop.dataDir, dirPath)) return false;
   }
   return true;
 }
 
+function profilePaths(profile) {
+  const out = [];
+  if (profile.code && profile.code.configDir) out.push(["Code config folder", profile.code.configDir]);
+  if (profile.desktop && profile.desktop.dataDir) out.push(["Desktop data folder", profile.desktop.dataDir]);
+  if (profile.desktop && profile.desktop.appPath) out.push(["launcher", profile.desktop.appPath]);
+  return out;
+}
+
+export function pathOwner(candidate, profiles, exceptName = null) {
+  for (const other of profiles) {
+    if (exceptName !== null && other.name === exceptName) continue;
+    for (const [label, owned] of profilePaths(other)) {
+      if (pathsOverlap(candidate, owned)) return { name: other.name, label, path: owned };
+    }
+  }
+  return null;
+}
+
+export function pathOwnerMessage(owner) {
+  return `That overlaps profile "${owner.name}"'s ${owner.label} (${tildify(owner.path)}). Pick a different path.`;
+}
+
+export function aliasOwner(aliasName, profiles, exceptName = null) {
+  const hit = profiles.find(
+    (p) => (exceptName === null || p.name !== exceptName) && p.code && p.code.aliasName === aliasName
+  );
+  return hit ? hit.name : null;
+}
+
+export function launcherPathProblem(appPath, { sourceAppPath = null, profiles = [], exceptName = null, currentAppPath = null } = {}) {
+  if (sourceAppPath && pathsOverlap(appPath, sourceAppPath)) {
+    return `That is the Claude.app the profile runs (${tildify(sourceAppPath)}). Pick a different path.`;
+  }
+  const owner = pathOwner(appPath, profiles, exceptName);
+  if (owner) return pathOwnerMessage(owner);
+  if (fileExists(appPath) && !(currentAppPath && samePath(appPath, currentAppPath))) {
+    return isOwnLauncher(appPath)
+      ? `${tildify(appPath)} is already a launcher that is not this profile's. Pick a path that does not exist yet.`
+      : `${tildify(appPath)} already exists and is not a launcher made by this tool. Pick a path that does not exist yet.`;
+  }
+  return null;
+}
+
 export async function add() {
   header("Add a Claude profile");
+  assertRegistryWritable();
 
   explain(`
     A "profile" is an isolated Claude install that runs alongside your existing
@@ -247,50 +295,7 @@ export async function add() {
     return;
   }
 
-  let desktopResult = null;
-  let codeResult = null;
-
-  if (desktopConfig) {
-    // Hand the Code config dir to the Desktop launcher so it can export
-    // CLAUDE_CONFIG_DIR. Without this, Claude Code sessions started from
-    // inside Claude Desktop fall back to ~/.claude in every profile, and
-    // CLAUDE.md / settings.json / per-project memory merge across profiles
-    // even though Desktop itself is cleanly isolated.
-    // Undefined when the profile has no Code target, in which case the launcher
-    // omits --env and behaves exactly as it did before.
-    desktopResult = setupDesktop({
-      ...desktopConfig,
-      codeConfigDir: codeConfig?.configDir,
-    });
-  }
-  if (codeConfig) {
-    codeResult = setupCode(codeConfig);
-  }
-
-  // ---- Persist to registry -------------------------------------------
-
-  addToRegistry({
-    name,
-    type: targets,
-    desktop: desktopResult
-      ? {
-          dataDir: desktopResult.dataDir,
-          appPath: desktopResult.appPath,
-          claudeAppPath: desktopResult.claudeAppPath,
-          color: desktopResult.color || null,
-        }
-      : null,
-    code: codeResult
-      ? {
-          configDir: codeResult.configDir,
-          aliasName: codeResult.aliasName,
-          shell: codeResult.shell,
-          rcPath: codeResult.rcPath,
-          ghConfigDir: codeResult.ghConfigDir || null,
-        }
-      : null,
-    createdAt: new Date().toISOString(),
-  });
+  const { desktopResult, codeResult } = applyNewProfile({ name, desktopConfig, codeConfig });
 
   // A first profile is built by this version from scratch, so there is
   // nothing older to bring up to date. Record that, or the very next command
@@ -310,6 +315,64 @@ export async function add() {
   // ---- Final guidance -------------------------------------------------
 
   printNextSteps({ name, desktopResult, codeResult });
+}
+
+function profileType(profile) {
+  return profile.desktop && profile.code ? "both" : profile.desktop ? "desktop" : "code";
+}
+
+function desktopEntry(result) {
+  return {
+    dataDir: result.dataDir,
+    appPath: result.appPath,
+    claudeAppPath: result.claudeAppPath,
+    color: result.color || null,
+  };
+}
+
+function codeEntry(result) {
+  return {
+    configDir: result.configDir,
+    aliasName: result.aliasName,
+    shell: result.shell,
+    rcPath: result.rcPath,
+    ghConfigDir: result.ghConfigDir || null,
+  };
+}
+
+export function applyNewProfile({ name, desktopConfig, codeConfig }) {
+  const record = { name, type: null, desktop: null, code: null, createdAt: new Date().toISOString() };
+  let desktopResult = null;
+  let codeResult = null;
+  const ghConfigDir = codeConfig && codeConfig.isolateGh ? defaultGhConfigDirFor(codeConfig.configDir) : undefined;
+  try {
+    if (desktopConfig) {
+      record.desktop = desktopEntry({ ...desktopConfig, color: null });
+      desktopResult = setupDesktop({
+        ...desktopConfig,
+        codeConfigDir: codeConfig?.configDir,
+        ghConfigDir,
+      });
+      record.desktop = desktopEntry(desktopResult);
+    }
+    if (codeConfig) {
+      const target = aliasTargetFor(null);
+      record.code = codeEntry({ ...codeConfig, ...target, ghConfigDir });
+      codeResult = setupCode(codeConfig);
+      record.code = codeEntry(codeResult);
+    }
+  } catch (e) {
+    if (record.desktop || record.code) {
+      record.type = profileType(record);
+      addToRegistry(record);
+      err(`Setup of "${name}" stopped partway: ${e.message}`);
+      info(`What was created is registered, so ${command(`claude-multiprofile remove ${name}`)} can clean it up.`);
+    }
+    throw e;
+  }
+  record.type = profileType(record);
+  addToRegistry(record);
+  return { desktopResult, codeResult };
 }
 
 // ===========================================================================
@@ -368,6 +431,7 @@ async function enableGhForProfile(profile) {
     aliasName: profile.code.aliasName,
     configDir: profile.code.configDir,
     ghConfigDir,
+    code: profile.code,
   });
   ok(`Alias "${profile.code.aliasName}" updated in ${pathStr(tildify(rcPath))}.`);
 
@@ -494,31 +558,36 @@ async function linkExisting(profile, missing) {
 
   const next = { ...profile };
 
-  if (codeConfig) {
-    const codeResult = setupCode(codeConfig);
-    next.code = {
-      configDir: codeResult.configDir,
-      aliasName: codeResult.aliasName,
-      shell: codeResult.shell,
-      rcPath: codeResult.rcPath,
-      ghConfigDir: codeResult.ghConfigDir || null,
-    };
+  try {
+    if (codeConfig) {
+      next.code = codeEntry({
+        ...codeConfig,
+        ...aliasTargetFor(null),
+        ghConfigDir: codeConfig.isolateGh ? defaultGhConfigDirFor(codeConfig.configDir) : null,
+      });
+      next.code = codeEntry(setupCode(codeConfig));
+    }
+    if (desktopConfig) {
+      next.desktop = desktopEntry({ ...desktopConfig, color: null });
+      // New launcher: pass the config dir straight in, whether it was already
+      // there or we just created it.
+      next.desktop = desktopEntry(
+        setupDesktop({
+          ...desktopConfig,
+          codeConfigDir: next.code ? next.code.configDir : undefined,
+          ghConfigDir: next.code ? next.code.ghConfigDir || undefined : undefined,
+        })
+      );
+    }
+  } catch (e) {
+    next.type = profileType(next);
+    replaceProfile(profile.name, next);
+    err(`Linking stopped partway: ${e.message}`);
+    info(`What was created is registered, so ${command(`claude-multiprofile remove ${profile.name}`)} can clean it up.`);
+    throw e;
   }
 
-  if (desktopConfig) {
-    // New launcher: pass the config dir straight in, whether it was already
-    // there or we just created it.
-    const desktopResult = setupDesktop({
-      ...desktopConfig,
-      codeConfigDir: next.code ? next.code.configDir : undefined,
-    });
-    next.desktop = {
-      dataDir: desktopResult.dataDir,
-      appPath: desktopResult.appPath,
-      claudeAppPath: desktopResult.claudeAppPath,
-      color: desktopResult.color || null,
-    };
-  } else if (next.code && profile.desktop) {
+  if (!desktopConfig && next.code && profile.desktop) {
     // Existing launcher, newly linked Code target: the launcher must be
     // rebuilt so it exports CLAUDE_CONFIG_DIR. Without this the link is
     // cosmetic.
@@ -601,15 +670,16 @@ async function askDesktopQuestions(name) {
     const customPath = await input({
       message: "Path to Claude.app (or leave blank to skip Desktop setup):",
       validate: (v) => {
-        if (!v) return true;
-        const p = expandHome(v);
+        if (!v.trim()) return true;
+        const p = resolveUserPath(v);
+        if (!p) return "Use a full path, starting with / or ~/.";
         if (!fileExists(p)) return `Not found: ${p}`;
         if (!p.endsWith(".app")) return "Path must end in .app";
         return true;
       },
     });
-    if (!customPath) return null;
-    claudeAppPath = expandHome(customPath);
+    if (!customPath.trim()) return null;
+    claudeAppPath = resolveUserPath(customPath);
   } else {
     info(`Found Claude Desktop at ${pathStr(claudeAppPath)}.`);
   }
@@ -626,15 +696,18 @@ async function askDesktopQuestions(name) {
     message: "Data folder for this profile:",
     default: defaultData,
     validate: (v) => {
-      const p = expandHome(v.trim());
-      if (!p) return "Path cannot be empty.";
-      if (p === path.join(HOME, "Library", "Application Support", "Claude")) {
+      if (!v.trim()) return "Path cannot be empty.";
+      const p = resolveUserPath(v);
+      if (!p) return "Use a full path, starting with / or ~/.";
+      if (samePath(p, path.join(HOME, "Library", "Application Support", "Claude"))) {
         return "That's the default Claude folder. Pick a different path so the new profile stays isolated.";
       }
+      const owner = pathOwner(p, getRegistry().profiles);
+      if (owner) return pathOwnerMessage(owner);
       return true;
     },
   });
-  const dataDir = expandHome(dataDirRaw.trim());
+  const dataDir = resolveUserPath(dataDirRaw);
 
   // Same protection as the Code config dir: never silently adopt a folder
   // that already exists and belongs to something else.
@@ -671,12 +744,13 @@ async function askDesktopQuestions(name) {
     message: "Where to save the launcher .app:",
     default: defaultApp,
     validate: (v) => {
-      const p = expandHome(v.trim());
+      const p = resolveUserPath(v);
+      if (!p) return "Use a full path, starting with / or ~/.";
       if (!p.endsWith(".app")) return "Path must end in .app";
-      return true;
+      return launcherPathProblem(p, { sourceAppPath: claudeAppPath, profiles: getRegistry().profiles }) || true;
     },
   });
-  const appPath = expandHome(appPathRaw.trim());
+  const appPath = resolveUserPath(appPathRaw);
 
   const applyIcon = await confirm({
     message: "Copy the Claude icon onto the launcher? (recommended)",
@@ -754,15 +828,18 @@ async function askCodeQuestions(name) {
     message: "Config folder for this profile:",
     default: defaultDir,
     validate: (v) => {
-      const p = expandHome(v.trim());
-      if (!p) return "Path cannot be empty.";
-      if (p === DEFAULT_CLAUDE_CONFIG_DIR) {
+      if (!v.trim()) return "Path cannot be empty.";
+      const p = resolveUserPath(v);
+      if (!p) return "Use a full path, starting with / or ~/.";
+      if (samePath(p, DEFAULT_CLAUDE_CONFIG_DIR)) {
         return "That's the default Claude Code folder. Pick a different path.";
       }
+      const owner = pathOwner(p, getRegistry().profiles);
+      if (owner) return pathOwnerMessage(owner);
       return true;
     },
   });
-  const configDir = expandHome(configDirRaw.trim());
+  const configDir = resolveUserPath(configDirRaw);
 
   // Claiming a directory that already exists and isn't ours is how another
   // tool's data (claude-mem, a hand-rolled setup) gets adopted into a profile
@@ -798,6 +875,12 @@ async function askCodeQuestions(name) {
         return "Don't shadow the bare `claude` command; pick a different alias.";
       if (!/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(v))
         return "Alias must start with a letter and contain only letters, digits, hyphens, or underscores.";
+      const owner = aliasOwner(v, getRegistry().profiles, name);
+      if (owner) return `"${v}" is already the alias of profile "${owner}". Pick a different alias.`;
+      const conflict = managedAliasConflict({ aliasName: v, configDir });
+      if (conflict) {
+        return `"${v}" in ${tildify(conflict.rcPath)} already launches ${conflict.configDir ? tildify(conflict.configDir) : "a different setup"}. Pick a different alias.`;
+      }
       return true;
     },
   });
@@ -810,13 +893,17 @@ async function askCodeQuestions(name) {
       setup into the new profile so you don't redo it: settings, CLAUDE.md,
       skills, slash commands, agents, hooks, plugins, and MCP servers.
 
+      Settings and MCP servers are copied as they are, including any API
+      keys or tokens in them. The new profile can use those credentials to
+      access the same services as your default profile.
+
       Nothing from USING that account comes along: no conversations, no
-      prompt history, no sessions, no caches. Sign-in does not carry over
-      either; Claude Code keeps it in the macOS Keychain under a key tied to
+      prompt history, no sessions, no caches. Claude's Keychain sign-in does
+      not carry over; Claude Code keeps it under a key tied to
       the config folder, so you'll sign in fresh on first launch.
     `);
     seedFromDefault = await confirm({
-      message: "Copy your Claude Code setup into the new profile? (recommended)",
+      message: "Copy your Claude Code setup, including any API keys or tokens, into the new profile?",
       default: true,
     });
   }

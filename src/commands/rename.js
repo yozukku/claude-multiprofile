@@ -30,7 +30,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { select, input, confirm } from "@inquirer/prompts";
-import { getRegistry, findProfile, replaceProfile } from "../registry.js";
+import { getRegistry, findProfile, replaceProfile, assertRegistryWritable } from "../registry.js";
 import { resyncDenyRules } from "../permissions.js";
 import {
   addAlias,
@@ -38,7 +38,11 @@ import {
   defaultConfigDirFor,
   defaultAliasNameFor,
   defaultGhConfigDirFor,
+  rebaseJsonFile,
+  SETTINGS_REBASE_KEYS,
+  managedAliasConflict,
 } from "../code.js";
+import { aliasTargetFor } from "../shell.js";
 import {
   compileApp,
   launchTargetFor,
@@ -48,8 +52,14 @@ import {
   dataDirInUse,
 } from "../desktop.js";
 import { clonePathFor, cloneIsRunning } from "../appclone.js";
-import { moveUpdateBlock } from "../updates.js";
-import { RESERVED_NAMES } from "./add.js";
+import { moveUpdateBlock, localConfigRootFor } from "../updates.js";
+import {
+  RESERVED_NAMES,
+  pathOwner,
+  pathOwnerMessage,
+  aliasOwner,
+  launcherPathProblem,
+} from "./add.js";
 import {
   header,
   ok,
@@ -63,6 +73,7 @@ import {
   tildify,
   fileExists,
   sanitizeName,
+  samePath,
 } from "../util.js";
 
 const LSREGISTER =
@@ -115,8 +126,68 @@ export function planRenamePaths(profile, oldName, newName) {
   return { newCode, newDesktop, plan };
 }
 
+export function renamePreflight(profile, oldName, newName, { newCode, newDesktop }, profiles) {
+  const problems = [];
+  const taken = (from, to) => to !== from && !samePath(from, to) && fileExists(to);
+  const claim = (label, from, to) => {
+    if (taken(from, to)) {
+      problems.push(`${label}: ${tildify(to)} already exists.`);
+      return;
+    }
+    const owner = pathOwner(to, profiles, oldName);
+    if (owner) problems.push(`${label}: ${pathOwnerMessage(owner)}`);
+  };
+  if (profile.code) {
+    if (newCode.configDir !== profile.code.configDir) claim("Code config", profile.code.configDir, newCode.configDir);
+    if (newCode.aliasName !== profile.code.aliasName) {
+      const owner = aliasOwner(newCode.aliasName, profiles, oldName);
+      if (owner) problems.push(`Shell alias: "${newCode.aliasName}" is already the alias of profile "${owner}".`);
+      const conflict = managedAliasConflict({ aliasName: newCode.aliasName, configDir: newCode.configDir, code: profile.code });
+      if (conflict) problems.push(`Shell alias: "${newCode.aliasName}" in ${tildify(conflict.rcPath)} already launches something else.`);
+    }
+  }
+  if (profile.desktop) {
+    if (newDesktop.dataDir !== profile.desktop.dataDir) {
+      claim("Desktop data", profile.desktop.dataDir, newDesktop.dataDir);
+      const fromRoot = localConfigRootFor(profile.desktop.dataDir);
+      const toRoot = localConfigRootFor(newDesktop.dataDir);
+      if (taken(fromRoot, toRoot)) problems.push(`Update settings: ${tildify(toRoot)} already exists.`);
+    }
+    if (newDesktop.appPath !== profile.desktop.appPath) {
+      const problem = launcherPathProblem(newDesktop.appPath, {
+        sourceAppPath: profile.desktop.claudeAppPath,
+        profiles,
+        exceptName: oldName,
+      });
+      if (problem) problems.push(`Launcher app: ${problem}`);
+    }
+    if (taken(clonePathFor(oldName), clonePathFor(newName))) {
+      problems.push(`Copy of Claude: ${tildify(clonePathFor(newName))} already exists.`);
+    }
+  }
+  return problems;
+}
+
+function readFileOrNull(file) {
+  try {
+    return fs.readFileSync(file);
+  } catch {
+    return null;
+  }
+}
+
+function rebaseCodeConfig(fromDir, toDir) {
+  for (const manifest of ["installed_plugins.json", "known_marketplaces.json"]) {
+    const file = path.join(toDir, "plugins", manifest);
+    if (fs.existsSync(file)) rebaseJsonFile(file, fromDir, toDir);
+  }
+  const settings = path.join(toDir, "settings.json");
+  if (fs.existsSync(settings)) rebaseJsonFile(settings, fromDir, toDir, { keys: SETTINGS_REBASE_KEYS });
+}
+
 export async function rename(args = []) {
   header("Rename a profile");
+  assertRegistryWritable();
 
   const reg = getRegistry();
   if (reg.profiles.length === 0) {
@@ -192,6 +263,11 @@ export async function rename(args = []) {
   // ---- Work out the new paths ---------------------------------------------
 
   const { newCode, newDesktop, plan } = planRenamePaths(profile, oldName, newName);
+  const problems = renamePreflight(profile, oldName, newName, { newCode, newDesktop }, getRegistry().profiles);
+  if (problems.length > 0) {
+    for (const problem of problems) err(problem);
+    throw new Error(`Cannot rename "${oldName}" to "${newName}". Nothing was changed.`);
+  }
 
   // ---- Show the plan and confirm ------------------------------------------
 
@@ -235,105 +311,97 @@ export async function rename(args = []) {
 
   step("Applying");
 
-  // Code: move the dir, swap the alias.
-  if (profile.code) {
-    if (newCode.configDir !== profile.code.configDir) {
-      try {
-        if (moveDir(profile.code.configDir, newCode.configDir)) {
+  const undo = [];
+  const oldLaunchTarget = profile.desktop ? launchTargetFor(oldName, profile.desktop) : null;
+  try {
+    // Code: move the dir, swap the alias.
+    if (profile.code) {
+      const oldDir = profile.code.configDir;
+      if (newCode.configDir !== oldDir) {
+        if (moveDir(oldDir, newCode.configDir)) {
+          undo.push(() => {
+            fs.renameSync(newCode.configDir, oldDir);
+            rebaseCodeConfig(newCode.configDir, oldDir);
+          });
           ok(`Moved config folder to ${pathStr(tildify(newCode.configDir))}.`);
+          rebaseCodeConfig(oldDir, newCode.configDir);
         } else {
-          warn(`Config folder ${tildify(profile.code.configDir)} not found; skipped.`);
+          warn(`Config folder ${tildify(oldDir)} not found; skipped.`);
         }
-      } catch (e) {
-        err(`Could not move config folder: ${e.message}`);
-        err("Aborting before any further changes. Nothing else was modified.");
-        process.exit(1);
       }
+      const rcFile = aliasTargetFor(profile.code).rcPath;
+      const rcBefore = readFileOrNull(rcFile);
+      undo.push(() => {
+        if (rcBefore === null) fs.rmSync(rcFile, { force: true });
+        else fs.writeFileSync(rcFile, rcBefore);
+      });
+      if (newCode.aliasName !== profile.code.aliasName) {
+        removeAlias(profile.code.aliasName, profile.code);
+      }
+      // The gh config dir lives inside the profile's config dir, so it moved
+      // with it above. Recompute it from the new location so the rewritten
+      // alias exports the path that now exists rather than the old one.
+      if (profile.code.ghConfigDir) {
+        newCode.ghConfigDir = defaultGhConfigDirFor(newCode.configDir);
+      }
+      const { rcPath } = addAlias({
+        aliasName: newCode.aliasName,
+        configDir: newCode.configDir,
+        ghConfigDir: newCode.ghConfigDir,
+        code: profile.code,
+      });
+      newCode.rcPath = rcPath;
+      ok(`Alias "${newCode.aliasName}" written to ${pathStr(tildify(rcPath))}.`);
     }
-    if (newCode.aliasName !== profile.code.aliasName) {
-      removeAlias(profile.code.aliasName);
-    }
-    // The gh config dir lives inside the profile's config dir, so it moved
-    // with it above. Recompute it from the new location so the rewritten
-    // alias exports the path that now exists rather than the old one.
-    if (profile.code.ghConfigDir) {
-      newCode.ghConfigDir = defaultGhConfigDirFor(newCode.configDir);
-    }
-    const { rcPath } = addAlias({
-      aliasName: newCode.aliasName,
-      configDir: newCode.configDir,
-      ghConfigDir: newCode.ghConfigDir,
-    });
-    newCode.rcPath = rcPath;
-    ok(`Alias "${newCode.aliasName}" written to ${pathStr(tildify(rcPath))}.`);
-  }
 
-  // Desktop: move data, rebuild the launcher so its embedded path and bundle
-  // ID match the new name.
-  if (profile.desktop) {
-    if (newDesktop.dataDir !== profile.desktop.dataDir) {
-      try {
-        if (moveDir(profile.desktop.dataDir, newDesktop.dataDir)) {
+    // Desktop: move data, rebuild the launcher so its embedded path and bundle
+    // ID match the new name.
+    if (profile.desktop) {
+      const oldData = profile.desktop.dataDir;
+      if (newDesktop.dataDir !== oldData) {
+        if (moveDir(oldData, newDesktop.dataDir)) {
+          undo.push(() => fs.renameSync(newDesktop.dataDir, oldData));
           ok(`Moved data folder to ${pathStr(tildify(newDesktop.dataDir))}.`);
         } else {
-          warn(`Data folder ${tildify(profile.desktop.dataDir)} not found; skipped.`);
+          warn(`Data folder ${tildify(oldData)} not found; skipped.`);
         }
-      } catch (e) {
-        err(`Could not move data folder: ${e.message}`);
-        process.exit(1);
-      }
-      // Claude reads the update block from a folder named after the data
-      // folder, so it has to move with it or it silently stops applying.
-      try {
-        if (moveUpdateBlock(profile.desktop.dataDir, newDesktop.dataDir)) {
-          ok("Moved its update settings with it.");
-        }
-      } catch (e) {
-        warn(`Could not move the update settings: ${e.message}`);
-        info(`Run ${command("claude-multiprofile doctor --fix")} to set them up again.`);
-      }
-    }
-
-    // The copy of Claude.app is named after the profile. Left behind, it
-    // would be orphaned and the renamed profile would have no copy at all.
-    const oldClone = clonePathFor(oldName);
-    const newClone = clonePathFor(newName);
-    if (fileExists(oldClone) && !fileExists(newClone)) {
-      try {
-        fs.renameSync(oldClone, newClone);
-        if (fileExists(LSREGISTER)) {
-          try {
-            execFileSync(LSREGISTER, ["-u", oldClone], { stdio: "pipe" });
-            execFileSync(LSREGISTER, ["-f", newClone], { stdio: "pipe" });
-          } catch {
-            // Non-fatal; registration catches up.
-          }
-        }
-        ok(`Moved its copy of Claude to ${pathStr(tildify(newClone))}.`);
-      } catch (e) {
-        warn(`Could not move its copy of Claude: ${e.message}`);
-        info(`Run ${command("claude-multiprofile doctor --fix")} to build a new one.`);
-      }
-    }
-
-    // Unregister and delete the old launcher before building the new one, so
-    // LaunchServices doesn't keep an entry pointing at a bundle that's gone.
-    if (fileExists(profile.desktop.appPath)) {
-      if (fileExists(LSREGISTER)) {
+        // Claude reads the update block from a folder named after the data
+        // folder, so it has to move with it or it silently stops applying.
         try {
-          execFileSync(LSREGISTER, ["-u", profile.desktop.appPath], { stdio: "pipe" });
-        } catch {
-          // Non-fatal.
+          if (moveUpdateBlock(oldData, newDesktop.dataDir)) {
+            undo.push(() => fs.renameSync(localConfigRootFor(newDesktop.dataDir), localConfigRootFor(oldData)));
+            ok("Moved its update settings with it.");
+          }
+        } catch (e) {
+          warn(`Could not move the update settings: ${e.message}`);
+          info(`Run ${command("claude-multiprofile doctor --fix")} to set them up again.`);
         }
       }
-      try {
-        fs.rmSync(profile.desktop.appPath, { recursive: true, force: true });
-      } catch {
-        warn(`Could not delete the old launcher at ${tildify(profile.desktop.appPath)}.`);
-      }
-    }
 
-    try {
+      // The copy of Claude.app is named after the profile. Left behind, it
+      // would be orphaned and the renamed profile would have no copy at all.
+      const oldClone = clonePathFor(oldName);
+      const newClone = clonePathFor(newName);
+      if (fileExists(oldClone) && !fileExists(newClone)) {
+        try {
+          fs.renameSync(oldClone, newClone);
+          undo.push(() => fs.renameSync(newClone, oldClone));
+          if (fileExists(LSREGISTER)) {
+            try {
+              execFileSync(LSREGISTER, ["-u", oldClone], { stdio: "pipe" });
+              execFileSync(LSREGISTER, ["-f", newClone], { stdio: "pipe" });
+            } catch {
+              // Non-fatal; registration catches up.
+            }
+          }
+          ok(`Moved its copy of Claude to ${pathStr(tildify(newClone))}.`);
+        } catch (e) {
+          warn(`Could not move its copy of Claude: ${e.message}`);
+          info(`Run ${command("claude-multiprofile doctor --fix")} to build a new one.`);
+        }
+      }
+
+      const launcherMoves = newDesktop.appPath !== profile.desktop.appPath;
       // Pass the (possibly renamed) Code config dir through so the rebuilt
       // launcher keeps exporting CLAUDE_CONFIG_DIR. Omitting it here would
       // silently drop the --env flag on rename, putting Desktop-spawned
@@ -348,23 +416,58 @@ export async function rename(args = []) {
         // working GH_CONFIG_DIR from the launcher.
         ghConfigDir: newCode ? newCode.ghConfigDir || undefined : undefined,
       });
+      undo.push(() => {
+        if (launcherMoves) {
+          fs.rmSync(newDesktop.appPath, { recursive: true, force: true });
+          return;
+        }
+        compileApp({
+          name: oldName,
+          dataDir: profile.desktop.dataDir,
+          appPath: profile.desktop.appPath,
+          ...oldLaunchTarget,
+          codeConfigDir: profile.code ? profile.code.configDir : undefined,
+          ghConfigDir: profile.code ? profile.code.ghConfigDir || undefined : undefined,
+        });
+      });
       copyClaudeIcon(newDesktop.appPath, profile.desktop.claudeAppPath);
       ok(`Rebuilt launcher at ${pathStr(tildify(newDesktop.appPath))}.`);
-    } catch (e) {
-      err(`Could not rebuild the launcher: ${e.message}`);
-      info(`You can recreate it with ${command("claude-multiprofile add")} using the new name.`);
     }
+
+    // ---- Registry + deny rules ----------------------------------------------
+
+    replaceProfile(oldName, {
+      ...profile,
+      name: newName,
+      code: newCode,
+      desktop: newDesktop,
+    });
+    ok(`Registry updated.`);
+  } catch (e) {
+    for (const revert of undo.reverse()) {
+      try {
+        revert();
+      } catch (undoError) {
+        warn(`Could not undo part of the rename: ${undoError.message}`);
+      }
+    }
+    throw new Error(`Could not rename "${oldName}" to "${newName}": ${e.message}. What had changed was put back.`);
   }
 
-  // ---- Registry + deny rules ----------------------------------------------
-
-  replaceProfile(oldName, {
-    ...profile,
-    name: newName,
-    code: newCode,
-    desktop: newDesktop,
-  });
-  ok(`Registry updated.`);
+  if (profile.desktop && newDesktop.appPath !== profile.desktop.appPath && fileExists(profile.desktop.appPath)) {
+    if (fileExists(LSREGISTER)) {
+      try {
+        execFileSync(LSREGISTER, ["-u", profile.desktop.appPath], { stdio: "pipe" });
+      } catch {
+        // Non-fatal.
+      }
+    }
+    try {
+      fs.rmSync(profile.desktop.appPath, { recursive: true, force: true });
+    } catch {
+      warn(`Could not delete the old launcher at ${tildify(profile.desktop.appPath)}.`);
+    }
+  }
 
   resyncDenyRules(getRegistry(), { verbose: true });
 

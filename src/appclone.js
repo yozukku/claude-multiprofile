@@ -258,13 +258,35 @@ export function ensureColoredClone({ name, claudeAppPath, color, force = false }
   const rebuild = (force || cloneIsStale(clonePath, claudeAppPath)) && !cloneIsRunning(clonePath);
   if (rebuild) {
     fs.mkdirSync(CLONE_PARENT, { recursive: true });
-    if (fileExists(clonePath)) fs.rmSync(clonePath, { recursive: true, force: true });
-    // -c asks for an APFS clone; fall back to a real copy on other filesystems.
+    const staged = `${clonePath}.refreshing`;
+    const previous = `${clonePath}.previous`;
+    fs.rmSync(staged, { recursive: true, force: true });
     try {
-      execFileSync("/bin/cp", ["-Rc", claudeAppPath, clonePath]);
-    } catch {
-      execFileSync("/bin/cp", ["-R", claudeAppPath, clonePath]);
+      // -c asks for an APFS clone; fall back to a real copy on other filesystems.
+      try {
+        execFileSync("/bin/cp", ["-Rc", claudeAppPath, staged]);
+      } catch {
+        fs.rmSync(staged, { recursive: true, force: true });
+        execFileSync("/bin/cp", ["-R", claudeAppPath, staged]);
+      }
+      const want = appVersion(claudeAppPath);
+      const got = appVersion(staged);
+      if (want && got !== want) {
+        throw new Error(`the copy came out as ${got}, not ${want}`);
+      }
+    } catch (e) {
+      fs.rmSync(staged, { recursive: true, force: true });
+      throw e;
     }
+    fs.rmSync(previous, { recursive: true, force: true });
+    if (fileExists(clonePath)) fs.renameSync(clonePath, previous);
+    try {
+      fs.renameSync(staged, clonePath);
+    } catch (e) {
+      if (fileExists(previous)) fs.renameSync(previous, clonePath);
+      throw e;
+    }
+    fs.rmSync(previous, { recursive: true, force: true });
   }
 
   // Tint from the copy's own icon, not the source's. A copy that updated
@@ -318,6 +340,16 @@ export function applyColor(clonePath, claudeAppPath, color) {
       // Best effort.
     }
   }
+}
+
+export function refreshLeftovers(clonePath) {
+  return [`${clonePath}.refreshing`, `${clonePath}.previous`].filter((p) => fileExists(p));
+}
+
+export function clearRefreshLeftovers(clonePath) {
+  const previous = `${clonePath}.previous`;
+  if (!fileExists(clonePath) && fileExists(previous)) fs.renameSync(previous, clonePath);
+  for (const p of refreshLeftovers(clonePath)) fs.rmSync(p, { recursive: true, force: true });
 }
 
 export function removeClone(name) {

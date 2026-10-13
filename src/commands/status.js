@@ -9,6 +9,7 @@ import { getRegistry, registryLocation, registryHealth } from "../registry.js";
 import { detectDefaults } from "../detect.js";
 import { resolveClaude } from "../claudebin.js";
 import {
+  aliasTargetFor,
   detectShell,
   rcPathForShell,
   readManagedAliases,
@@ -35,9 +36,9 @@ export async function status() {
   const defaults = detectDefaults();
   const reg = getRegistry();
   const shell = detectShell();
-  const aliasNames = new Set(readManagedAliases(shell).map((a) => a.name));
 
-  if (registryHealth().state === "corrupt") {
+  const corrupt = registryHealth().state === "corrupt";
+  if (corrupt) {
     warn(`The registry at ${pathStr(tildify(registryLocation()))} is not valid JSON.`);
     info("Profiles below may be incomplete. Fix the JSON by hand (a .bak may sit next to it).");
     console.log("");
@@ -83,6 +84,10 @@ export async function status() {
   // ---- Additional profiles -------------------------------------------------
 
   if (reg.profiles.length === 0) {
+    if (corrupt) {
+      info(`No profiles could be read until ${pathStr(tildify(registryLocation()))} is valid JSON again.`);
+      return;
+    }
     info("No additional profiles configured.");
     info(`Run ${command("claude-multiprofile add")} to create one.`);
     return;
@@ -116,7 +121,8 @@ export async function status() {
 
     if (p.code) {
       const cfgOk = fileExists(p.code.configDir);
-      const aliasOk = aliasNames.has(p.code.aliasName);
+      const target = aliasTargetFor(p.code);
+      const aliasOk = readManagedAliases(target.shell, target.rcPath).some((a) => a.name === p.code.aliasName);
 
       console.log(
         `    ${cfgOk ? "✓" : "✗"} Code config folder: ${tildify(p.code.configDir)}`
@@ -124,7 +130,7 @@ export async function status() {
       if (!cfgOk) issues++;
 
       console.log(
-        `    ${aliasOk ? "✓" : "✗"} Shell alias "${p.code.aliasName}" in ${tildify(rcPathForShell(shell))}`
+        `    ${aliasOk ? "✓" : "✗"} Shell alias "${p.code.aliasName}" in ${tildify(target.rcPath)}`
       );
       if (!aliasOk) issues++;
     }
@@ -134,7 +140,7 @@ export async function status() {
     } else {
       warn(`    ${issues} issue${issues > 1 ? "s" : ""} detected.`);
       info(
-        `    Re-run ${command(`claude-multiprofile add`)} for this profile, or fix manually.`
+        `    Run ${command(`claude-multiprofile doctor --fix`)}, or fix manually.`
       );
     }
 

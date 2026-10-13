@@ -64,13 +64,15 @@ import {
   parseRunningCopies,
   runningCopies,
   cloneIsRunning,
+  refreshLeftovers,
+  clearRefreshLeftovers,
 } from "../appclone.js";
 import { resyncDenyRules, auditDenyRules, readProtectionEnabled } from "../permissions.js";
-import { updateBlockState, blockUpdates, wantsUpdateBlock } from "../updates.js";
-import { recordFixPass } from "../state.js";
+import { updateBlockState, blockUpdates, wantsUpdateBlock, localConfigRootFor } from "../updates.js";
+import { recordFixPass, toolVersion } from "../state.js";
 import { takeSnapshot, finishSnapshot, fixTargets, undoLatest } from "../snapshot.js";
 import { helperState, installHelper, recentLaunchLog, HELPER_PATH, LAUNCH_LOG } from "../launchhelper.js";
-import { detectShell, rcPathForShell, readManagedAliases } from "../shell.js";
+import { aliasTargetFor, readManagedAliases } from "../shell.js";
 import {
   HOME,
   header,
@@ -82,6 +84,7 @@ import {
   pathStr,
   tildify,
   fileExists,
+  fileStaysWithinDir,
   command,
   dim,
   isMac,
@@ -375,9 +378,6 @@ function checkProfiles(t, reg) {
     return;
   }
 
-  const shell = detectShell();
-  const aliasNames = new Set(readManagedAliases(shell).map((a) => a.name));
-
   // Detect two profiles pointing at the same directory, which is a genuine
   // conflict where each would clobber the other's state.
   const dirOwners = new Map();
@@ -396,6 +396,7 @@ function checkProfiles(t, reg) {
         console.log(`    ✓ ${label}: ${tildify(dir)}`);
       } else {
         console.log(`    ✗ ${label}: ${tildify(dir)} ${dim("(missing)")}`);
+        if (label === "Launcher" && isMac()) info(`      Rebuild it with ${command("claude-multiprofile doctor --fix")}`);
         t.problems++;
       }
 
@@ -410,22 +411,58 @@ function checkProfiles(t, reg) {
 
       // Same-directory conflict between two profiles.
       if (label !== "Launcher") {
-        const prev = dirOwners.get(dir);
+        const key = isMac() ? path.resolve(dir).toLowerCase() : path.resolve(dir);
+        const prev = dirOwners.get(key);
         if (prev && prev !== p.name) {
           err(`      Conflict: also used by profile "${prev}".`);
           t.problems++;
         }
-        dirOwners.set(dir, p.name);
+        dirOwners.set(key, p.name);
       }
     }
 
     if (p.code && p.code.aliasName) {
-      if (aliasNames.has(p.code.aliasName)) {
-        console.log(`    ✓ Alias "${p.code.aliasName}" present in ${tildify(rcPathForShell(shell))}`);
+      const { shell, rcPath } = aliasTargetFor(p.code);
+      if (readManagedAliases(shell, rcPath).some((a) => a.name === p.code.aliasName)) {
+        console.log(`    ✓ Alias "${p.code.aliasName}" present in ${tildify(rcPath)}`);
       } else {
-        console.log(`    ✗ Alias "${p.code.aliasName}" missing from ${tildify(rcPathForShell(shell))}`);
+        console.log(`    ✗ Alias "${p.code.aliasName}" missing from ${tildify(rcPath)}`);
         t.problems++;
       }
+    }
+  }
+}
+
+function rebuildMissingLaunchers(t, reg, fix) {
+  if (!fix || !isMac()) return;
+  const missing = reg.profiles.filter(
+    (p) => p.desktop && p.desktop.appPath && p.desktop.dataDir && !fileExists(p.desktop.appPath)
+  );
+  if (missing.length === 0) return;
+
+  step("Missing launchers");
+  for (const p of missing) {
+    warn(`${p.name}: its launcher ${tildify(p.desktop.appPath)} is missing.`);
+    if (!fileExists(p.desktop.claudeAppPath)) {
+      err(`  Cannot rebuild: Claude.app not found at ${p.desktop.claudeAppPath}`);
+      t.problems++;
+      continue;
+    }
+    try {
+      compileApp({
+        name: p.name,
+        dataDir: p.desktop.dataDir,
+        appPath: p.desktop.appPath,
+        ...launchTargetFor(p.name, p.desktop),
+        codeConfigDir: p.code ? p.code.configDir : undefined,
+        ghConfigDir: p.code ? p.code.ghConfigDir || undefined : undefined,
+      });
+      copyClaudeIcon(p.desktop.appPath, p.desktop.claudeAppPath);
+      refreshLauncher(p.desktop.appPath);
+      ok(`  Repaired: launcher rebuilt at ${tildify(p.desktop.appPath)}`);
+    } catch (e) {
+      err(`  Could not rebuild the launcher: ${e.message}`);
+      t.problems++;
     }
   }
 }
@@ -727,6 +764,26 @@ function checkAppClones(t, reg, fix) {
 
   step("Per-profile Claude copies");
 
+  for (const p of desktop) {
+    const clone = clonePathFor(p.name);
+    const leftovers = refreshLeftovers(clone);
+    if (leftovers.length === 0) continue;
+    warn(`${p.name}: an update of its copy stopped partway and left ${leftovers.map(tildify).join(" and ")} behind.`);
+    if (!fix) {
+      info("  Its launcher cleans this up on the next click and opens the copy as it is.");
+      info(`  Repair now with ${command("claude-multiprofile doctor --fix")}`);
+      t.warnings++;
+      continue;
+    }
+    try {
+      clearRefreshLeftovers(clone);
+      ok("  Repaired: removed what the stopped update left behind.");
+    } catch (e) {
+      err(`  Could not clean up after it: ${e.message}`);
+      t.problems++;
+    }
+  }
+
   // Profiles created before v0.1.23 have no clone at all, so their launcher
   // still targets the shared Claude.app and must use `open -n`.
   for (const p of desktop.filter((x) => !fileExists(clonePathFor(x.name)))) {
@@ -894,7 +951,7 @@ function checkSeededProfiles(t, reg, fix) {
       { file: path.join(dir, "plugins", "installed_plugins.json"), keys: null },
       { file: path.join(dir, "plugins", "known_marketplaces.json"), keys: null },
       { file: settingsFile, keys: SETTINGS_REBASE_KEYS },
-    ].filter((x) => fileExists(x.file));
+    ].filter((x) => fileExists(x.file) && fileStaysWithinDir(x.file, dir));
     let rebasable = 0;
     let stuck = 0;
     for (const { file, keys } of files) {
@@ -1091,9 +1148,13 @@ function checkManagedUpdates(t, reg, fix) {
     info("  Every update relaunches it on your default account and removes its colour.");
     if (fix) {
       try {
-        blockUpdates(p.desktop.dataDir);
-        ok("  Repaired: updates now managed by its launcher.");
-        info("  Takes effect the next time the profile starts.");
+        if (blockUpdates(p.desktop.dataDir) === "foreign") {
+          warn(`  Not repaired: ${tildify(localConfigRootFor(p.desktop.dataDir))} holds files the tool did not write, so it was left alone.`);
+          t.warnings++;
+        } else {
+          ok("  Repaired: updates now managed by its launcher.");
+          info("  Takes effect the next time the profile starts.");
+        }
       } catch (e) {
         err(`  Could not set up managed updates: ${e.message}`);
         t.problems++;
@@ -1367,6 +1428,10 @@ function undoLastFix(args) {
 }
 
 export async function doctor(args = []) {
+  const unknown = args.filter((a) => !["--fix", "--undo", "--force"].includes(a));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown option for doctor: ${unknown.join(" ")}. Expected --fix, --undo, or --undo --force.`);
+  }
   header("claude-multiprofile doctor");
 
   if (args.includes("--undo")) return undoLastFix(args);
@@ -1385,23 +1450,12 @@ export async function doctor(args = []) {
     }
   }
 
-  // Version of this tool, read the same way cli.js does.
-  let currentVersion = "unknown";
-  try {
-    const pkgPath = path.join(
-      path.dirname(new URL(import.meta.url).pathname),
-      "..",
-      "..",
-      "package.json"
-    );
-    currentVersion = JSON.parse(fs.readFileSync(pkgPath, "utf8")).version;
-  } catch {
-    // Non-fatal; the version check will just report "unknown".
-  }
+  const currentVersion = toolVersion() || "unknown";
 
   // A corrupt registry first: every later check reads from it, and a corrupt
   // file otherwise masquerades as "no profiles configured".
-  if (registryHealth().state === "corrupt") {
+  const corrupt = registryHealth().state === "corrupt";
+  if (corrupt) {
     step("Registry");
     err(`${tildify(registryLocation())} exists but is not valid JSON.`);
     info("Profiles are configured but can't be read. Mutating commands will refuse to run.");
@@ -1412,6 +1466,7 @@ export async function doctor(args = []) {
   checkClaudeBinary(t);
   checkBrokenInstalls(t);
   checkOwnVersion(t, currentVersion);
+  rebuildMissingLaunchers(t, reg, fix);
   checkProfiles(t, reg);
   checkLauncherBundleIds(t, reg, fix);
   checkLauncherEnv(t, reg, fix);
@@ -1438,7 +1493,7 @@ export async function doctor(args = []) {
   // A completed fix pass is what brings profiles up to this version's way of
   // working. Record it, so later commands stop reminding. Problems it could
   // not fix are still reported above and by the next doctor run.
-  if (fix) recordFixPass(currentVersion === "unknown" ? null : currentVersion);
+  if (fix && !corrupt) recordFixPass(currentVersion === "unknown" ? null : currentVersion);
 
   if (snap) {
     let changed = [];
@@ -1447,12 +1502,9 @@ export async function doctor(args = []) {
     } catch {
       // The fixes stand; only the undo record is lost.
     }
-    // state.json alone is bookkeeping, not a change worth undoing.
-    const real = changed.filter((f) => !f.endsWith(`${path.sep}state.json`));
-    if (real.length === 0 && changed.length > 0) fs.rmSync(snap.dir, { recursive: true, force: true });
-    if (real.length > 0) {
+    if (changed.length > 0) {
       console.log("");
-      info(`--fix changed ${real.length} file${real.length === 1 ? "" : "s"}. To put ${real.length === 1 ? "it" : "them"} back: ${command("claude-multiprofile doctor --undo")}`);
+      info(`--fix changed ${changed.length} file${changed.length === 1 ? "" : "s"}. To put ${changed.length === 1 ? "it" : "them"} back: ${command("claude-multiprofile doctor --undo")}`);
     }
   }
 

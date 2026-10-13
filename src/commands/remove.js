@@ -9,12 +9,13 @@
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
 import { select, confirm } from "@inquirer/prompts";
-import { getRegistry, removeFromRegistry } from "../registry.js";
+import { getRegistry, removeFromRegistry, assertRegistryWritable } from "../registry.js";
 import { removeAlias } from "../code.js";
 import { resyncDenyRules, stripManagedDenyRules } from "../permissions.js";
 import { removeClone, clonePathFor, cloneIsRunning } from "../appclone.js";
-import { dataDirInUse } from "../desktop.js";
+import { dataDirInUse, isOwnLauncher } from "../desktop.js";
 import { unblockUpdates } from "../updates.js";
+import { pathOwner } from "./add.js";
 import {
   header,
   ok,
@@ -36,6 +37,7 @@ const LSREGISTER =
 
 export async function remove(args) {
   header("Remove a Claude profile");
+  assertRegistryWritable();
 
   const reg = getRegistry();
   if (reg.profiles.length === 0) {
@@ -60,6 +62,11 @@ export async function remove(args) {
     warn(`Profile "${target}" not found. Run \`claude-multiprofile list\` to see options.`);
     return;
   }
+  const sharedWith = (p) => {
+    const owner = pathOwner(p, reg.profiles, profile.name);
+    if (owner) warn(`Kept ${tildify(p)}: it overlaps profile "${owner.name}"'s ${owner.label} (${tildify(owner.path)}).`);
+    return Boolean(owner);
+  };
 
   // Removal deletes the profile's copy of Claude.app, and deleting an app
   // while it runs can crash it mid-write. Refuse before asking anything.
@@ -94,7 +101,11 @@ export async function remove(args) {
 
   if (profile.desktop) {
     step("Removing Desktop launcher");
-    if (fileExists(profile.desktop.appPath)) {
+    if (sharedWith(profile.desktop.appPath)) {
+      info("Launcher left in place.");
+    } else if (fileExists(profile.desktop.appPath) && !isOwnLauncher(profile.desktop.appPath)) {
+      warn(`Kept ${tildify(profile.desktop.appPath)}: it is not a launcher made by this tool.`);
+    } else if (fileExists(profile.desktop.appPath)) {
       // Unregister from LaunchServices BEFORE deleting the bundle. Once the
       // files are gone lsregister can't resolve the bundle to remove its
       // entry, and the stale registration lingers until the database is
@@ -131,7 +142,8 @@ export async function remove(args) {
       message: `Also delete the Desktop data folder (${tildify(profile.desktop.dataDir)})? This is permanent.`,
       default: false,
     });
-    if (wipeDesktopData && fileExists(profile.desktop.dataDir)) {
+    const keepSharedData = wipeDesktopData && sharedWith(profile.desktop.dataDir);
+    if (wipeDesktopData && !keepSharedData && fileExists(profile.desktop.dataDir)) {
       try {
         fs.rmSync(profile.desktop.dataDir, { recursive: true, force: true });
         ok(`Deleted ${pathStr(tildify(profile.desktop.dataDir))}.`);
@@ -141,7 +153,7 @@ export async function remove(args) {
     }
     // The update settings belong with the data folder: kept with it, removed
     // with it. Only what the tool wrote is ever removed.
-    if (wipeDesktopData) {
+    if (wipeDesktopData && !keepSharedData) {
       try {
         if (unblockUpdates(profile.desktop.dataDir)) ok("Removed its update settings.");
       } catch (e) {
@@ -154,14 +166,15 @@ export async function remove(args) {
 
   if (profile.code) {
     step("Removing Code alias");
-    const { rcPath } = removeAlias(profile.code.aliasName);
+    const { rcPath } = removeAlias(profile.code.aliasName, profile.code);
     ok(`Alias removed from ${pathStr(tildify(rcPath))}.`);
 
     const wipeCodeData = await confirm({
       message: `Also delete the Code config folder (${tildify(profile.code.configDir)})? This is permanent.`,
       default: false,
     });
-    if (wipeCodeData && fileExists(profile.code.configDir)) {
+    const keepSharedConfig = wipeCodeData && sharedWith(profile.code.configDir);
+    if (wipeCodeData && !keepSharedConfig && fileExists(profile.code.configDir)) {
       try {
         fs.rmSync(profile.code.configDir, { recursive: true, force: true });
         ok(`Deleted ${pathStr(tildify(profile.code.configDir))}.`);

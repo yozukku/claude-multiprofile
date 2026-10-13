@@ -9,7 +9,7 @@
 //                      default account and removes its colour, which is why
 //                      this is not the default.
 
-import { getRegistry, findProfile, replaceProfile } from "../registry.js";
+import { getRegistry, findProfile, replaceProfile, assertRegistryWritable } from "../registry.js";
 import { updateBlockState, blockUpdates, unblockUpdates, wantsUpdateBlock } from "../updates.js";
 import { header, ok, warn, err, info, command, pathStr } from "../util.js";
 
@@ -27,6 +27,7 @@ export async function selfUpdate(args) {
   const reg = getRegistry();
   const desktops = reg.profiles.filter((p) => p.desktop);
   const [name, choice] = args;
+  if (choice) assertRegistryWritable();
 
   if (!name) {
     if (desktops.length === 0) {
