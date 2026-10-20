@@ -12,7 +12,7 @@ import { select, confirm } from "@inquirer/prompts";
 import { getRegistry, removeFromRegistry, assertRegistryWritable } from "../registry.js";
 import { removeAlias } from "../code.js";
 import { resyncDenyRules, stripManagedDenyRules } from "../permissions.js";
-import { removeClone, clonePathFor, cloneIsRunning } from "../appclone.js";
+import { removeClone, copyOfProfileRunning } from "../appclone.js";
 import { dataDirInUse, isOwnLauncher } from "../desktop.js";
 import { unblockUpdates } from "../updates.js";
 import { pathOwner } from "./add.js";
@@ -70,7 +70,7 @@ export async function remove(args) {
 
   // Removal deletes the profile's copy of Claude.app, and deleting an app
   // while it runs can crash it mid-write. Refuse before asking anything.
-  if (profile.desktop && (cloneIsRunning(clonePathFor(profile.name)) || dataDirInUse(profile.desktop.dataDir))) {
+  if (profile.desktop && (copyOfProfileRunning(profile.name) || dataDirInUse(profile.desktop.dataDir))) {
     warn(`"${profile.name}" is open in Claude Desktop.`);
     info("Quit it first (Claude > Quit Claude in that window), then run remove again.");
     return;

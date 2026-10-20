@@ -29,7 +29,7 @@ import { HOME, fileExists } from "./util.js";
 import { COLORS } from "./appclone.js";
 
 // Bump when HELPER_JS changes, so doctor can tell a stale copy on disk.
-export const HELPER_VERSION = 3;
+export const HELPER_VERSION = 5;
 
 const TOOL_DIR = path.join(HOME, "Library", "Application Support", "claude-multiprofile");
 export const HELPER_PATH = path.join(TOOL_DIR, "bin", "launch.js");
@@ -170,11 +170,11 @@ function compare(a, b) {
 // live under Contents/Frameworks, so matching Contents/MacOS/ excludes them.
 function running(clone) {
   var out = app.doShellScript('/bin/ps -axww -o pid=,command=');
-  var needle = clone + '/Contents/MacOS/';
+  var needle = (clone + '/Contents/MacOS/').toLowerCase();
   var found = [];
   out.split(/[\\r\\n]+/).forEach(function (line) {
     var m = line.match(/^\\s*(\\d+)\\s+(.*)$/);
-    if (m && m[2].indexOf(needle) === 0) found.push({ pid: parseInt(m[1], 10), command: m[2] });
+    if (m && m[2].toLowerCase().indexOf(needle) === 0) found.push({ pid: parseInt(m[1], 10), command: m[2] });
   });
   return found;
 }
@@ -223,12 +223,36 @@ function tintApart(appPath, hue) {
   if (out !== 'OK') throw new Error('the icon step ended without setting the icon');
 }
 
+function hasIcon(appPath) {
+  if (!exists(appPath + '/Icon\\r')) return false;
+  try {
+    var bytes = app.doShellScript('/usr/bin/xattr -px com.apple.FinderInfo ' + q(appPath)).trim().split(/\\s+/);
+    return bytes.length >= 10 && (parseInt(bytes[8], 16) & 4) !== 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+function retint(clone, hue) {
+  if (!hue || !exists(clone) || hasIcon(clone)) return '';
+  if (env('CMP_LAUNCH_DRY_RUN') === '1') return 'would-retint';
+  try {
+    tintApart(clone, hue);
+    try { app.doShellScript(q(LSREGISTER) + ' -f ' + q(clone)); } catch (e) {}
+    log('INFO', 'the copy had lost its colour; put it back');
+    return 'retinted';
+  } catch (e) {
+    log('ERROR', 'the copy had lost its colour, and putting it back failed: ' + e.message);
+    return 'retint-failed';
+  }
+}
+
 function helperBusy(clone) {
   var me = $.NSProcessInfo.processInfo.processIdentifier;
-  var needle = 'launch.js ' + clone + ' ';
+  var needle = ('launch.js ' + clone + ' ').toLowerCase();
   return app.doShellScript('/bin/ps -axww -o pid=,command=').split(/[\\r\\n]+/).some(function (line) {
     var m = line.match(/^\\s*(\\d+)\\s+(.*)$/);
-    return m && parseInt(m[1], 10) !== me && m[2].indexOf(needle) >= 0;
+    return m && parseInt(m[1], 10) !== me && m[2].toLowerCase().indexOf(needle) >= 0;
   });
 }
 
@@ -365,7 +389,8 @@ function run(argv) {
       log('INFO', 'quit the wrong-account window; reopening on the profile');
     }
     var r = refresh(clone, source, hue);
-    if (dry) return 'not running: ' + r;
+    var t = r === 'busy' || r.indexOf('would-refresh') === 0 ? '' : retint(clone, hue);
+    if (dry) return 'not running: ' + r + (t ? '; ' + t : '');
     if (r === 'busy') return 'busy';
   } catch (e) {
     log('ERROR', 'unexpected: ' + e.message + '; opening as is');

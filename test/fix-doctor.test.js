@@ -229,3 +229,60 @@ test("doctor --fix rebuilds a registered Desktop profile's missing launcher", (t
   assert.ok(fs.existsSync(path.join(appPath, "Contents", "Resources", "Scripts", "main.scpt")));
   assert.match(s.run(["doctor"]).out, /✓ Launcher: /);
 });
+
+function captured(fn) {
+  const lines = [];
+  const real = { log: console.log, error: console.error };
+  console.log = console.error = (...a) => lines.push(a.join(" "));
+  try {
+    fn();
+  } finally {
+    console.log = real.log;
+    console.error = real.error;
+  }
+  return lines.join("\n");
+}
+
+test("doctor: a copy pinned to the Dock is a problem, and says what it leads to", async () => {
+  const { reportPinnedCopy } = await import("../src/commands/doctor.js");
+  const t = { problems: 0, warnings: 0 };
+  const out = captured(() => reportPinnedCopy(t, { name: "w", desktop: { appPath: "/Users/x/Applications/Claude W.app" } }));
+  assert.deepEqual(t, { problems: 1, warnings: 0 });
+  assert.match(out, /pinned to the Dock instead of its launcher/);
+  assert.match(out, /default account/);
+  assert.match(out, /updates itself/);
+  assert.match(out, /colour/);
+  assert.match(out, /Remove that tile and pin .*Claude W\.app/);
+});
+
+test("doctor: a lost colour says how it comes back, and that the copy's own Dock tile will not", async () => {
+  const { reportLostColour } = await import("../src/commands/doctor.js");
+  const p = { name: "w", desktop: { color: "teal", appPath: "/Users/x/Applications/Claude W.app" } };
+  const t = { problems: 0, warnings: 0 };
+  const plain = captured(() => reportLostColour(t, p, "/nonexistent/Claude W.app", { fix: false, pinned: false }));
+  assert.match(plain, /teal colour is gone/);
+  assert.match(plain, /comes back the next time you open .*Claude W\.app.*doctor --fix/);
+  assert.doesNotMatch(plain, /does not bring it back/);
+  const pinned = captured(() => reportLostColour(t, p, "/nonexistent/Claude W.app", { fix: false, pinned: true }));
+  assert.match(pinned, /does not bring it back/);
+  assert.deepEqual(t, { problems: 0, warnings: 2 });
+});
+
+test("doctor: a copy that is behind still has its lost colour reported", (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("per-profile copies are macOS only");
+    return;
+  }
+  const s = sandbox(t);
+  const appSupport = path.join(s.home, "Library", "Application Support");
+  const source = fakeApp(path.join(s.root, "Source.app"), "2.0.0");
+  fakeApp(path.join(appSupport, "claude-multiprofile", "apps", "Claude W.app"), "1.0.0");
+  const dataDir = path.join(appSupport, "Claude-W");
+  fs.mkdirSync(dataDir, { recursive: true });
+  s.writeRegistry([{ name: "w", type: "desktop", code: null, desktop: { dataDir, appPath: path.join(s.home, "Applications", "Claude W.app"), claudeAppPath: source, color: "teal" } }]);
+
+  const out = s.run(["doctor"]).out;
+  const section = out.slice(out.indexOf("Per-profile Claude copies"), out.indexOf("Profile updates"));
+  assert.match(section, /w: its teal colour is gone/);
+  assert.match(section, /copy is Claude 1\.0\.0, but 2\.0\.0 is installed/);
+});

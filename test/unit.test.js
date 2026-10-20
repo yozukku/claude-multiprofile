@@ -947,7 +947,7 @@ test("appclone: colour table and clone paths", async () => {
   }
   // Clones live outside ~/Applications so they do not clutter the app list;
   // the launcher is the thing meant to be visible.
-  assert.match(c.clonePathFor("work"), /claude-multiprofile\/apps\/Claude work\.app$/);
+  assert.match(c.clonePathFor("work"), /claude-multiprofile\/apps\/Claude WORK\.app$/);
   assert.ok(!c.clonePathFor("work").includes("/Applications/Claude.app"));
 });
 
@@ -1926,7 +1926,7 @@ test("doctor: a copy that is behind is information when its launcher updates it,
   const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: cfg, NO_COLOR: "1" };
   const profiles = [];
   for (const [name, managed] of [["managed", true], ["direct", false]]) {
-    const clone = path.join(appSupport, "claude-multiprofile", "apps", `Claude ${name}.app`);
+    const clone = path.join(appSupport, "claude-multiprofile", "apps", `Claude ${titleCase(name)}.app`);
     fakeApp(clone, "1.0.0"); // behind the source
     const dataDir = path.join(appSupport, `Claude-${name.toUpperCase()}`);
     fs.mkdirSync(dataDir, { recursive: true });

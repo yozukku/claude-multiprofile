@@ -53,7 +53,7 @@ import {
 } from "../util.js";
 import { DEFAULT_DESKTOP_DATA_DIR, detectDefaults } from "../detect.js";
 import { desktopConfigFile, seedDesktopMcpServers, dataDirInUse } from "../desktop.js";
-import { clonePathFor, cloneIsRunning } from "../appclone.js";
+import { copyOfProfileRunning } from "../appclone.js";
 
 const EXT_DIR_NAME = "Claude Extensions";
 const EXT_SETTINGS_DIR_NAME = "Claude Extensions Settings";
@@ -311,7 +311,7 @@ async function copyConnectorsStep(names, source, target) {
 
   // Claude rewrites this file from its own state while it runs, so a copy
   // into a running profile would be lost at its next save.
-  if (cloneIsRunning(clonePathFor(target.profile.name)) || dataDirInUse(target.dataDir)) {
+  if (copyOfProfileRunning(target.profile.name) || dataDirInUse(target.dataDir)) {
     warn(`${target.label} is open in Claude Desktop, so connectors were not copied.`);
     info("Claude would overwrite them. Quit it, then run this command again.");
     return;

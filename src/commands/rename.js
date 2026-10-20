@@ -51,7 +51,7 @@ import {
   defaultAppPathFor,
   dataDirInUse,
 } from "../desktop.js";
-import { clonePathFor, cloneIsRunning } from "../appclone.js";
+import { clonePathFor, currentClonePath, copyOfProfileRunning } from "../appclone.js";
 import { moveUpdateBlock, localConfigRootFor } from "../updates.js";
 import {
   RESERVED_NAMES,
@@ -161,7 +161,7 @@ export function renamePreflight(profile, oldName, newName, { newCode, newDesktop
       });
       if (problem) problems.push(`Launcher app: ${problem}`);
     }
-    if (taken(clonePathFor(oldName), clonePathFor(newName))) {
+    if (taken(currentClonePath(oldName), clonePathFor(newName))) {
       problems.push(`Copy of Claude: ${tildify(clonePathFor(newName))} already exists.`);
     }
   }
@@ -254,7 +254,7 @@ export async function rename(args = []) {
   // started with, which would split the profile's data across two folders.
   // Its copy of Claude.app moves too. Checked before the review, so nobody
   // confirms a rename that is about to be refused.
-  if (profile.desktop && (cloneIsRunning(clonePathFor(oldName)) || dataDirInUse(profile.desktop.dataDir))) {
+  if (profile.desktop && (copyOfProfileRunning(oldName) || dataDirInUse(profile.desktop.dataDir))) {
     err(`"${oldName}" is open in Claude Desktop.`);
     info("Quit it first (Claude > Quit Claude in that window), then run the rename again.");
     process.exit(1);
@@ -380,7 +380,7 @@ export async function rename(args = []) {
 
       // The copy of Claude.app is named after the profile. Left behind, it
       // would be orphaned and the renamed profile would have no copy at all.
-      const oldClone = clonePathFor(oldName);
+      const oldClone = currentClonePath(oldName);
       const newClone = clonePathFor(newName);
       if (fileExists(oldClone) && !fileExists(newClone)) {
         try {

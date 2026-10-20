@@ -53,7 +53,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { HOME, fileExists, tildify, compareVersions } from "./util.js";
+import { HOME, fileExists, tildify, compareVersions, titleCase } from "./util.js";
 
 // Where per-profile clones live. Outside ~/Applications so they do not clutter
 // the app list the user browses; the launcher is the thing meant to be visible.
@@ -82,8 +82,78 @@ export function isColor(name) {
   return Object.prototype.hasOwnProperty.call(COLORS, name);
 }
 
+export function cloneNameFor(profileName) {
+  return `Claude ${titleCase(profileName)}.app`;
+}
+
 export function clonePathFor(profileName) {
+  return path.join(CLONE_PARENT, cloneNameFor(profileName));
+}
+
+export function legacyClonePathFor(profileName) {
   return path.join(CLONE_PARENT, `Claude ${profileName}.app`);
+}
+
+function cloneNames(profileName) {
+  return [...new Set([cloneNameFor(profileName), `Claude ${profileName}.app`])];
+}
+
+function foldName(name) {
+  return name.normalize("NFC").toLowerCase();
+}
+
+function onDiskEntry(name, parent = CLONE_PARENT) {
+  let entries;
+  try {
+    entries = fs.readdirSync(parent);
+  } catch {
+    return null;
+  }
+  if (entries.includes(name)) return name;
+  return entries.find((e) => foldName(e) === foldName(name)) || null;
+}
+
+export function existingClonePath(profileName) {
+  for (const name of cloneNames(profileName)) {
+    const entry = onDiskEntry(name);
+    if (entry) return path.join(CLONE_PARENT, entry);
+  }
+  return null;
+}
+
+export function currentClonePath(profileName) {
+  return existingClonePath(profileName) || clonePathFor(profileName);
+}
+
+export function cloneMigration(profileName) {
+  const target = cloneNameFor(profileName);
+  const moves = [];
+  const conflicts = [];
+  for (const suffix of ["", ".refreshing", ".previous"]) {
+    const wanted = target + suffix;
+    const found = [...new Set(cloneNames(profileName).map((n) => onDiskEntry(n + suffix)).filter(Boolean))];
+    const stray = found.filter((e) => e !== wanted);
+    if (stray.length === 0) continue;
+    if (found.includes(wanted) || stray.length > 1) {
+      conflicts.push(...found.map((e) => path.join(CLONE_PARENT, e)));
+      continue;
+    }
+    moves.push({ from: path.join(CLONE_PARENT, stray[0]), to: path.join(CLONE_PARENT, wanted) });
+  }
+  return { moves, conflicts };
+}
+
+export function copyOfProfileRunning(profileName, psOutput = psSnapshot()) {
+  return cloneNames(profileName).some((name) => cloneIsRunning(path.join(CLONE_PARENT, name), psOutput));
+}
+
+export function migrateClone(profileName, psOutput = psSnapshot()) {
+  const plan = cloneMigration(profileName);
+  if (plan.conflicts.length > 0) return { status: "conflict", ...plan };
+  if (plan.moves.length === 0) return { status: "none", ...plan };
+  if (copyOfProfileRunning(profileName, psOutput)) return { status: "running", ...plan };
+  for (const m of plan.moves) fs.renameSync(m.from, m.to);
+  return { status: "renamed", ...plan };
 }
 
 // ---- The JXA bridge --------------------------------------------------------
@@ -191,7 +261,7 @@ export function cloneState(clonePath, claudeAppPath) {
 // would keep writing to. So anything destructive asks first.
 
 export function parseRunningCopies(psOutput, copyPath) {
-  const needle = path.join(copyPath, "Contents", "MacOS") + path.sep;
+  const needle = foldName(path.join(copyPath, "Contents", "MacOS") + path.sep);
   const found = [];
   for (const line of psOutput.split("\n")) {
     // Renderer/GPU helpers live in their own nested bundles under
@@ -199,7 +269,7 @@ export function parseRunningCopies(psOutput, copyPath) {
     // them. Matching on the word "Helper" as well would look like belt and
     // braces but would skip a profile actually named "Helper", and a profile
     // this check stays silent about is the exact failure it exists to catch.
-    if (!line.includes(needle)) continue;
+    if (!foldName(line).includes(needle)) continue;
     const match = line.trim().match(/^(\d+)\s+(.*)$/);
     if (match) found.push({ pid: match[1], command: match[2] });
   }
@@ -251,7 +321,7 @@ export function ensureColoredClone({ name, claudeAppPath, color, force = false }
     throw new Error(`Claude.app not found at ${claudeAppPath}`);
   }
 
-  const clonePath = clonePathFor(name);
+  const clonePath = currentClonePath(name);
   // Never rebuild a copy that is open: the delete below would pull the app
   // out from under it. Keeping the current copy is always safe, and the
   // launcher rebuilds it on the first click after it is quit.
@@ -353,12 +423,12 @@ export function clearRefreshLeftovers(clonePath) {
 }
 
 export function removeClone(name) {
-  const p = clonePathFor(name);
-  if (!fileExists(p)) return false;
+  const p = existingClonePath(name);
+  if (!p) return false;
   fs.rmSync(p, { recursive: true, force: true });
   return true;
 }
 
 export function describeClone(name) {
-  return tildify(clonePathFor(name));
+  return tildify(currentClonePath(name));
 }

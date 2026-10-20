@@ -39,6 +39,7 @@ import {
   compileApp,
   launchTargetFor,
   launcherUsesHelper,
+  launcherOpenTarget,
   copyClaudeIcon,
   findClaudeApp,
   DEFAULT_APPLET_BUNDLE_ID,
@@ -55,7 +56,13 @@ import {
   SETTINGS_REBASE_KEYS,
 } from "../code.js";
 import {
+  CLONE_PARENT,
   clonePathFor,
+  legacyClonePathFor,
+  existingClonePath,
+  currentClonePath,
+  cloneMigration,
+  migrateClone,
   cloneState,
   cloneVersions,
   ensureColoredClone,
@@ -748,9 +755,9 @@ function checkAccountCollisions(t, reg) {
 
 // Colour plays no part here: an uncoloured profile's clone goes stale just
 // the same.
-export function clonesToVersionCheck(profiles, exists = fileExists) {
+export function clonesToVersionCheck(profiles, exists = fileExists, pathFor = clonePathFor) {
   return profiles.filter(
-    (p) => p.desktop && p.desktop.claudeAppPath && exists(clonePathFor(p.name))
+    (p) => p.desktop && p.desktop.claudeAppPath && exists(pathFor(p.name))
   );
 }
 
@@ -765,7 +772,67 @@ function checkAppClones(t, reg, fix) {
   step("Per-profile Claude copies");
 
   for (const p of desktop) {
-    const clone = clonePathFor(p.name);
+    const plan = cloneMigration(p.name);
+    if (plan.moves.length === 0 && plan.conflicts.length === 0) continue;
+    if (plan.conflicts.length > 0) {
+      warn(`${p.name}: its copy of Claude exists under more than one name: ${plan.conflicts.map(tildify).join(", ")}.`);
+      info(`  Quit it, delete the one that is not ${pathStr(tildify(clonePathFor(p.name)))}, then run ${command("claude-multiprofile doctor --fix")}`);
+      t.warnings++;
+      continue;
+    }
+    warn(`${p.name}: its copy of Claude still has its old name: ${plan.moves.map((m) => tildify(m.from)).join(" and ")}.`);
+    info(`  The Dock shows that file name for the running window, not "${path.basename(clonePathFor(p.name), ".app")}".`);
+    if (!fix) {
+      info(`  Repair with ${command("claude-multiprofile doctor --fix")}`);
+      t.warnings++;
+      continue;
+    }
+    try {
+      const r = migrateClone(p.name);
+      if (r.status === "running") {
+        info("  It is open right now, so it was left alone. Quit it, then run doctor --fix again.");
+        t.warnings++;
+        continue;
+      }
+      refreshLauncher(clonePathFor(p.name));
+      ok(`  Repaired: renamed to ${pathStr(tildify(clonePathFor(p.name)))}.`);
+    } catch (e) {
+      err(`  Could not rename it: ${e.message}`);
+      t.problems++;
+    }
+  }
+
+  for (const p of desktop) {
+    const clone = existingClonePath(p.name);
+    if (!clone || !p.desktop.appPath || !fileExists(p.desktop.appPath)) continue;
+    const target = launcherOpenTarget(p.desktop.appPath);
+    if (!target || target === clone) continue;
+    if (path.dirname(target).toLowerCase() !== CLONE_PARENT.toLowerCase()) continue;
+    warn(`${p.name}: its launcher opens ${tildify(target)}, but its copy is ${tildify(clone)}.`);
+    if (!fix) {
+      info(`  Repair with ${command("claude-multiprofile doctor --fix")}`);
+      t.warnings++;
+      continue;
+    }
+    try {
+      compileApp({
+        name: p.name,
+        dataDir: p.desktop.dataDir,
+        appPath: p.desktop.appPath,
+        ...launchTargetFor(p.name, p.desktop),
+        codeConfigDir: p.code ? p.code.configDir : undefined,
+        ghConfigDir: p.code ? p.code.ghConfigDir || undefined : undefined,
+      });
+      refreshLauncher(p.desktop.appPath);
+      ok("  Repaired: launcher rebuilt in place to open it (a Dock pin keeps working).");
+    } catch (e) {
+      err(`  Could not rebuild the launcher: ${e.message}`);
+      t.problems++;
+    }
+  }
+
+  for (const p of desktop) {
+    const clone = currentClonePath(p.name);
     const leftovers = refreshLeftovers(clone);
     if (leftovers.length === 0) continue;
     warn(`${p.name}: an update of its copy stopped partway and left ${leftovers.map(tildify).join(" and ")} behind.`);
@@ -786,7 +853,7 @@ function checkAppClones(t, reg, fix) {
 
   // Profiles created before v0.1.23 have no clone at all, so their launcher
   // still targets the shared Claude.app and must use `open -n`.
-  for (const p of desktop.filter((x) => !fileExists(clonePathFor(x.name)))) {
+  for (const p of desktop.filter((x) => !existingClonePath(x.name))) {
     warn(`${p.name}: has no dedicated copy of Claude.app.`);
     info("  Clicking its Dock icon opens another window every time instead of");
     info("  focusing the one already open.");
@@ -819,10 +886,17 @@ function checkAppClones(t, reg, fix) {
     }
   }
 
-  for (const p of clonesToVersionCheck(desktop)) {
-    const clone = clonePathFor(p.name);
+  let pinned;
+  const isPinned = (p) => {
+    if (pinned === undefined) pinned = dockPinnedPaths();
+    return copyPinned(pinned, p);
+  };
+
+  for (const p of clonesToVersionCheck(desktop, fileExists, currentClonePath)) {
+    const clone = currentClonePath(p.name);
     const v = cloneVersions(clone, p.desktop.claudeAppPath);
     const state = cloneState(clone, p.desktop.claudeAppPath);
+    const colourLost = Boolean(p.desktop.color) && !hasCustomIcon(clone);
 
     // Behind its source: rebuilding is an upgrade, and re-tints on the way.
     if (state === "behind") {
@@ -852,6 +926,8 @@ function checkAppClones(t, reg, fix) {
         }
         continue;
       }
+
+      if (colourLost) reportLostColour(t, p, clone, { fix, pinned: isPinned(p) });
 
       if (managed) {
         info(`${p.name}: will update from Claude ${v.clone} to ${v.source} the next time you open it.`);
@@ -886,29 +962,35 @@ function checkAppClones(t, reg, fix) {
 
     // A matching version says nothing about the colour. An update swaps the
     // whole bundle directory, and the tint is Finder metadata on the old one.
-    if (hasCustomIcon(clone)) {
+    if (!colourLost) {
       ok(`${p.name}: ${p.desktop.color}, Claude ${dim(v.clone || "")}`);
       continue;
     }
 
-    warn(`${p.name}: its ${p.desktop.color} colour is gone.`);
-    info("  A Claude update replaces the whole app, and the colour went with it.");
-    if (fix) {
-      try {
-        // Re-tint in place from the copy's own icon. No rebuild: the build
-        // itself is fine, and may be newer than anything we could copy.
-        applyColor(clone, clone, p.desktop.color);
-        refreshLauncher(clone);
-        ok(`  Repaired: ${p.desktop.color} re-applied. The Dock shows it from the next launch.`);
-      } catch (e) {
-        err(`  Could not re-apply the colour: ${e.message}`);
-        t.problems++;
-      }
-    } else {
-      info(`  Repair with ${command("claude-multiprofile doctor --fix")}`);
-      t.warnings++;
-    }
+    reportLostColour(t, p, clone, { fix, pinned: isPinned(p) });
   }
+}
+
+export function reportLostColour(t, p, clone, { fix, pinned }) {
+  warn(`${p.name}: its ${p.desktop.color} colour is gone.`);
+  info("  A Claude update replaces the whole app, and the colour went with it.");
+  if (fix) {
+    try {
+      // Re-tint in place from the copy's own icon. No rebuild: the build
+      // itself is fine, and may be newer than anything we could copy.
+      applyColor(clone, clone, p.desktop.color);
+      refreshLauncher(clone);
+      ok(`  Repaired: ${p.desktop.color} re-applied. The Dock shows it from the next launch.`);
+    } catch (e) {
+      err(`  Could not re-apply the colour: ${e.message}`);
+      t.problems++;
+    }
+    return;
+  }
+  const launcher = p.desktop.appPath ? pathStr(tildify(p.desktop.appPath)) : "its launcher";
+  info(`  It comes back the next time you open ${launcher}, or now with ${command("claude-multiprofile doctor --fix")}.`);
+  if (pinned) info("  Clicking the copy's own tile in the Dock does not bring it back: that tile skips the launcher.");
+  t.warnings++;
 }
 
 // ---- Check: what an old seed left behind ------------------------------------
@@ -1076,7 +1158,7 @@ function checkDesktopConnectors(t, reg) {
 function checkManagedUpdates(t, reg, fix) {
   if (!isMac()) return;
   const withCopies = reg.profiles.filter(
-    (p) => p.desktop && p.desktop.claudeAppPath && fileExists(clonePathFor(p.name))
+    (p) => p.desktop && p.desktop.claudeAppPath && existingClonePath(p.name)
   );
   if (withCopies.length === 0) return;
 
@@ -1229,10 +1311,26 @@ function dockPinnedPaths() {
   }
 }
 
+function copyPinned(pinned, p) {
+  if (!pinned) return false;
+  const names = [currentClonePath(p.name), clonePathFor(p.name), legacyClonePathFor(p.name)].map((c) => c.toLowerCase());
+  return pinned.some((x) => names.includes(x.toLowerCase()));
+}
+
+export function reportPinnedCopy(t, p) {
+  err(`${p.name}: its Claude copy is pinned to the Dock instead of its launcher.`);
+  info("  Clicking that tile starts the copy directly, skipping the launcher, so the copy:");
+  info("    - opens on your default account, without this profile's data folder;");
+  info("    - updates itself, because blocking its updates is part of the profile;");
+  info("    - loses its colour with each of those updates.");
+  info(`  Remove that tile and pin ${pathStr(tildify(p.desktop.appPath))} instead.`);
+  t.problems++;
+}
+
 function checkDesktopLaunchPath(t, reg) {
   if (!isMac()) return;
   const withCopies = reg.profiles.filter(
-    (p) => p.desktop && p.desktop.appPath && fileExists(clonePathFor(p.name))
+    (p) => p.desktop && p.desktop.appPath && existingClonePath(p.name)
   );
   if (withCopies.length === 0) return;
 
@@ -1242,7 +1340,7 @@ function checkDesktopLaunchPath(t, reg) {
   let flagged = false;
 
   for (const p of withCopies) {
-    const copyPath = clonePathFor(p.name);
+    const copyPath = currentClonePath(p.name);
 
     for (const proc of runningCopies(copyPath)) {
       if (proc.command.includes("--user-data-dir=")) continue;
@@ -1254,13 +1352,9 @@ function checkDesktopLaunchPath(t, reg) {
       t.problems++;
     }
 
-    if (pinned && pinned.includes(copyPath.replace(/\/+$/, ""))) {
+    if (copyPinned(pinned, p)) {
       flagged = true;
-      warn(`${p.name}: its Claude copy is pinned to the Dock instead of its launcher.`);
-      info("  Clicking that tile starts the copy directly, skipping the launcher,");
-      info("  which is what drops --user-data-dir and opens the default profile.");
-      info(`  Remove that tile and pin ${pathStr(tildify(p.desktop.appPath))} instead.`);
-      t.warnings++;
+      reportPinnedCopy(t, p);
     }
   }
 

@@ -40,7 +40,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { ensureColoredClone, applyColor, clonePathFor, psSnapshot } from "./appclone.js";
+import { ensureColoredClone, applyColor, existingClonePath, psSnapshot } from "./appclone.js";
 import { installHelper, helperSpecFor } from "./launchhelper.js";
 import { blockUpdates } from "./updates.js";
 import {
@@ -377,6 +377,14 @@ export function launcherEnvVar(appPath, name) {
   return unAppleScript.replace(/'\\''/g, "'");
 }
 
+export function launcherOpenTarget(appPath) {
+  const src = readLauncherScript(appPath);
+  if (src === null) return undefined;
+  const m = src.match(/open (?:-n )?-a '(.*?)' --/);
+  if (!m) return null;
+  return m[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\").replace(/'\\''/g, "'");
+}
+
 export function launcherCodeConfigDir(appPath) {
   return launcherEnvVar(appPath, "CLAUDE_CONFIG_DIR");
 }
@@ -584,9 +592,10 @@ export function dataDirInUse(dataDir, psOutput = psSnapshot()) {
 // the running window, a new window on every click, and no launch helper.
 // Deciding it here, from the copy actually on disk, keeps them all agreeing.
 export function launchTargetFor(name, desktop) {
-  if (fileExists(clonePathFor(name))) {
+  const clone = existingClonePath(name);
+  if (clone) {
     return {
-      claudeAppPath: clonePathFor(name),
+      claudeAppPath: clone,
       dedicatedBundle: true,
       sourceAppPath: desktop.claudeAppPath,
       color: desktop.color || null,
